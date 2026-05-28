@@ -339,6 +339,7 @@ export async function liveTailSessionBrowserOutput(
   let lastHash: string | null = null;
   let unchangedSince = Date.now();
   let requireRecoveredContent = false;
+  let recoveredContentDeadlineMs = 0;
 
   try {
     // Probe once to see if the live tab is still alive; recover if not.
@@ -366,6 +367,7 @@ export async function liveTailSessionBrowserOutput(
       endpoint = { host: recovered.host, port: recovered.port };
       browserTabRef = recovered.ref;
       requireRecoveredContent = true;
+      recoveredContentDeadlineMs = Date.now() + stallThresholdMs;
     }
 
     while (true) {
@@ -375,7 +377,11 @@ export async function liveTailSessionBrowserOutput(
         ref: browserTabRef,
       });
       const fullText = harvested.lastAssistantMarkdown ?? harvested.lastAssistantText ?? "";
-      if (requireRecoveredContent && !isRecoveredConversationHarvestReady(harvested)) {
+      if (
+        requireRecoveredContent &&
+        !isRecoveredConversationHarvestReady(harvested) &&
+        Date.now() < recoveredContentDeadlineMs
+      ) {
         await new Promise((resolve) => setTimeout(resolve, LIVE_POLL_MS));
         continue;
       }
