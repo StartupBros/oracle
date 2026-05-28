@@ -19,6 +19,9 @@ const readyHarvest = {
   authenticated: true,
   assistantCount: 1,
   stopExists: false,
+  lastAssistantText: "Recovered answer",
+  lastAssistantMarkdown: "Recovered answer",
+  lastAssistantSnippet: "Recovered answer",
   state: "completed",
 };
 const logger = (_message: string) => {};
@@ -41,6 +44,7 @@ describe("recoverConversationTab flow", () => {
     }));
     vi.doMock("../../src/browser/index.js", () => ({
       acquireManualLoginChromeForRun,
+      isImageOnlyUiChromeText: () => false,
     }));
 
     const { recoverConversationTab } = await import("../../src/browser/recoverConversation.js");
@@ -81,6 +85,7 @@ describe("recoverConversationTab flow", () => {
     }));
     vi.doMock("../../src/browser/index.js", () => ({
       acquireManualLoginChromeForRun,
+      isImageOnlyUiChromeText: () => false,
     }));
 
     const { recoverConversationTab } = await import("../../src/browser/recoverConversation.js");
@@ -129,6 +134,7 @@ describe("recoverConversationTab flow", () => {
     }));
     vi.doMock("../../src/browser/index.js", () => ({
       acquireManualLoginChromeForRun,
+      isImageOnlyUiChromeText: () => false,
     }));
 
     const { recoverConversationTab } = await import("../../src/browser/recoverConversation.js");
@@ -158,6 +164,7 @@ describe("recoverConversationTab flow", () => {
     }));
     vi.doMock("../../src/browser/index.js", () => ({
       acquireManualLoginChromeForRun,
+      isImageOnlyUiChromeText: () => false,
     }));
 
     const { recoverConversationTab } = await import("../../src/browser/recoverConversation.js");

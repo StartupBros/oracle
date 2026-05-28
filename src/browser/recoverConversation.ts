@@ -2,7 +2,7 @@ import type { LaunchedChrome } from "chrome-launcher";
 import type { SessionMetadata } from "../sessionStore.js";
 import type { BrowserLogger } from "./types.js";
 import { resolveBrowserConfig } from "./config.js";
-import { acquireManualLoginChromeForRun } from "./index.js";
+import { acquireManualLoginChromeForRun, isImageOnlyUiChromeText } from "./index.js";
 import { isRecoverableChatGptConversationUrl } from "./reattachability.js";
 import { extractConversationIdFromUrl, harvestChatGptTab, openChatGptTarget } from "./liveTabs.js";
 
@@ -41,6 +41,18 @@ export function resolveRecoveryUrl(meta: SessionMetadata): string | null {
       return candidate as string;
     }
   }
+  for (const candidate of [harvest.conversationId, runtime.conversationId]) {
+    if (typeof candidate !== "string" || !/^[A-Za-z0-9_-]+$/.test(candidate)) {
+      continue;
+    }
+    const base =
+      meta?.browser?.config?.chatgptUrl ?? meta?.browser?.config?.url ?? "https://chatgpt.com/";
+    try {
+      return new URL(`/c/${candidate}`, base).toString();
+    } catch {
+      return `https://chatgpt.com/c/${candidate}`;
+    }
+  }
   return null;
 }
 
@@ -71,7 +83,18 @@ async function waitForRecoveredConversationReady(
   while (Date.now() < deadline) {
     try {
       const harvested = await harvestChatGptTab({ ...endpoint, ref });
-      if (harvested.assistantCount > 0 || harvested.stopExists) {
+      const latestAssistant =
+        harvested.lastAssistantMarkdown ??
+        harvested.lastAssistantText ??
+        harvested.lastAssistantSnippet ??
+        "";
+      if (
+        harvested.stopExists ||
+        (harvested.assistantCount > 0 &&
+          latestAssistant.trim().length > 0 &&
+          !isImageOnlyUiChromeText(latestAssistant) &&
+          !/^answer now$/i.test(latestAssistant.trim()))
+      ) {
         return;
       }
       lastError = new Error(`recovered tab is still ${harvested.state}`);

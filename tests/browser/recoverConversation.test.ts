@@ -74,6 +74,12 @@ describe("resolveRecoveryUrl", () => {
     ).toBe("https://chatgpt.com/c/runtime-only");
   });
 
+  test("builds a recovery URL from a stored conversation id", () => {
+    expect(resolveRecoveryUrl(metaWith({ conversationId: "runtime-id" }, undefined))).toBe(
+      "https://chatgpt.com/c/runtime-id",
+    );
+  });
+
   test("returns null when neither candidate is a valid conversation URL", () => {
     expect(
       resolveRecoveryUrl(
