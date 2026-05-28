@@ -28,6 +28,24 @@ function isRecoverableMissingTabError(message: string): boolean {
   );
 }
 
+function finishRecoveredChrome(
+  recoveredChrome: { kill: () => void; process?: { unref?: () => void } } | null,
+  closeAfterRecover: boolean | undefined,
+): void {
+  if (!recoveredChrome) {
+    return;
+  }
+  try {
+    if (closeAfterRecover) {
+      recoveredChrome.kill();
+    } else {
+      recoveredChrome.process?.unref?.();
+    }
+  } catch {
+    // best-effort cleanup
+  }
+}
+
 export interface BrowserHarvestOptions {
   writeOutputPath?: string;
   browserTabRef?: string;
@@ -250,7 +268,7 @@ export async function harvestSessionBrowserOutput(
   const ref = options.browserTabRef ?? resolveSessionTabRef(meta);
   const recoverIfMissing = options.recoverIfMissing !== false;
 
-  let recoveredChrome: { kill: () => void } | null = null;
+  let recoveredChrome: { kill: () => void; process?: { unref?: () => void } } | null = null;
   try {
     let harvested: ChatGptTabSummary;
     try {
@@ -270,7 +288,9 @@ export async function harvestSessionBrowserOutput(
           `No live ChatGPT tab matched session "${sessionId}". Attempting recovery by reopening the saved conversation URL.`,
         ),
       );
-      const recovered = await recoverConversationTab(meta, (line) => console.log(line));
+      const recovered = await recoverConversationTab(meta, (line) => console.log(line), {
+        existingEndpoint: initialEndpoint,
+      });
       recoveredChrome = recovered.chrome;
       harvested = await harvestChatGptTab({
         host: recovered.host,
@@ -291,13 +311,7 @@ export async function harvestSessionBrowserOutput(
     }
     return harvested;
   } finally {
-    if (recoveredChrome && options.closeAfterRecover) {
-      try {
-        recoveredChrome.kill();
-      } catch {
-        // best-effort cleanup
-      }
-    }
+    finishRecoveredChrome(recoveredChrome, options.closeAfterRecover);
   }
 }
 
@@ -315,7 +329,7 @@ export async function liveTailSessionBrowserOutput(
   };
   let browserTabRef = options.browserTabRef ?? resolveSessionTabRef(meta);
   const recoverIfMissing = options.recoverIfMissing !== false;
-  let recoveredChrome: { kill: () => void } | null = null;
+  let recoveredChrome: { kill: () => void; process?: { unref?: () => void } } | null = null;
   const stallThresholdMs = options.stallThresholdMs ?? DEFAULT_STALL_THRESHOLD_MS;
   let lastHash: string | null = null;
   let unchangedSince = Date.now();
@@ -338,7 +352,9 @@ export async function liveTailSessionBrowserOutput(
           `No live ChatGPT tab matched session "${sessionId}". Attempting recovery by reopening the saved conversation URL.`,
         ),
       );
-      const recovered = await recoverConversationTab(meta, (line) => console.log(line));
+      const recovered = await recoverConversationTab(meta, (line) => console.log(line), {
+        existingEndpoint: endpoint,
+      });
       recoveredChrome = recovered.chrome;
       endpoint = { host: recovered.host, port: recovered.port };
       browserTabRef = recovered.url;
@@ -395,12 +411,6 @@ export async function liveTailSessionBrowserOutput(
       await new Promise((resolve) => setTimeout(resolve, LIVE_POLL_MS));
     }
   } finally {
-    if (recoveredChrome && options.closeAfterRecover) {
-      try {
-        recoveredChrome.kill();
-      } catch {
-        // best-effort cleanup
-      }
-    }
+    finishRecoveredChrome(recoveredChrome, options.closeAfterRecover);
   }
 }

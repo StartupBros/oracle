@@ -49,7 +49,7 @@ describe("harvestSessionBrowserOutput recovery fallback", () => {
       )
       .mockResolvedValueOnce(completedHarvest);
 
-    const fakeChrome = { kill: vi.fn() };
+    const fakeChrome = { kill: vi.fn(), process: { unref: vi.fn() } };
     const recoverConversationTab = vi.fn(async (meta: SessionMetadata) => ({
       host: "127.0.0.1",
       port: 53999,
@@ -82,7 +82,9 @@ describe("harvestSessionBrowserOutput recovery fallback", () => {
 
     expect(harvestChatGptTab).toHaveBeenCalledTimes(2);
     expect(recoverConversationTab).toHaveBeenCalledTimes(1);
-    expect(recoverConversationTab).toHaveBeenCalledWith(baseMeta, expect.any(Function));
+    expect(recoverConversationTab).toHaveBeenCalledWith(baseMeta, expect.any(Function), {
+      existingEndpoint: { host: "127.0.0.1", port: 9222 },
+    });
     // After recovery, harvest is retried against the recovered endpoint/url.
     expect(harvestChatGptTab).toHaveBeenLastCalledWith(
       expect.objectContaining({
@@ -95,6 +97,7 @@ describe("harvestSessionBrowserOutput recovery fallback", () => {
     expect(updateSession).toHaveBeenCalled();
     // Default closeAfterRecover is false — Chrome stays alive for the user.
     expect(fakeChrome.kill).not.toHaveBeenCalled();
+    expect(fakeChrome.process.unref).toHaveBeenCalledTimes(1);
   });
 
   test("does not recover when recoverIfMissing is false; surfaces the original error", async () => {
@@ -169,7 +172,7 @@ describe("harvestSessionBrowserOutput recovery fallback", () => {
       .fn()
       .mockRejectedValueOnce(new Error("No ChatGPT tab matched"))
       .mockResolvedValueOnce(completedHarvest);
-    const fakeChrome = { kill: vi.fn() };
+    const fakeChrome = { kill: vi.fn(), process: { unref: vi.fn() } };
     vi.doMock("../../src/browser/liveTabs.js", () => ({
       collectChatGptTabs: vi.fn(),
       DEFAULT_REMOTE_CHROME_HOST: "127.0.0.1",
@@ -197,5 +200,6 @@ describe("harvestSessionBrowserOutput recovery fallback", () => {
       quietOutput: true,
     });
     expect(fakeChrome.kill).toHaveBeenCalledTimes(1);
+    expect(fakeChrome.process.unref).not.toHaveBeenCalled();
   });
 });
