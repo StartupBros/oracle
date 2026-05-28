@@ -1,6 +1,8 @@
-import { launch, type LaunchedChrome } from "chrome-launcher";
+import type { LaunchedChrome } from "chrome-launcher";
 import type { SessionMetadata } from "../sessionStore.js";
 import type { BrowserLogger } from "./types.js";
+import { resolveBrowserConfig } from "./config.js";
+import { acquireManualLoginChromeForRun } from "./index.js";
 import { isRecoverableChatGptConversationUrl } from "./reattachability.js";
 import { extractConversationIdFromUrl, harvestChatGptTab, openChatGptTarget } from "./liveTabs.js";
 
@@ -124,27 +126,19 @@ export async function recoverConversationTab(
   }
 
   const userDataDir = resolveRecoveryProfileDir(meta);
+  const config = resolveBrowserConfig(meta.browser?.config);
 
   logger(
     `[browser] Recovery: relaunching Chrome with profile ${userDataDir} and navigating to ${url}`,
   );
 
-  const chrome = await launch({
-    chromeFlags: [
-      "--no-first-run",
-      "--no-default-browser-check",
-      "--disable-features=AutomationControlled,TranslateUI",
-      "--disable-sync",
-      "--password-store=basic",
-      "--use-mock-keychain",
-      "--lang=en-US",
-      url,
-    ],
-    userDataDir,
-    handleSIGINT: false,
+  const { chrome } = await acquireManualLoginChromeForRun(userDataDir, config, logger, meta.id, {});
+  await openChatGptTarget({
+    host: chrome.host ?? "127.0.0.1",
+    port: chrome.port,
+    url,
   });
-
-  const host = "127.0.0.1";
+  const host = chrome.host ?? "127.0.0.1";
   const port = chrome.port;
 
   try {

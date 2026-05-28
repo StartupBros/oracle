@@ -31,7 +31,7 @@ describe("recoverConversationTab flow", () => {
   test("opens the saved URL in an existing Chrome endpoint before launching another profile", async () => {
     const openChatGptTarget = vi.fn(async () => "target-1");
     const harvestChatGptTab = vi.fn(async () => readyHarvest);
-    const launch = vi.fn();
+    const acquireManualLoginChromeForRun = vi.fn();
 
     vi.doMock("../../src/browser/liveTabs.js", () => ({
       extractConversationIdFromUrl: (url: string) =>
@@ -39,7 +39,9 @@ describe("recoverConversationTab flow", () => {
       openChatGptTarget,
       harvestChatGptTab,
     }));
-    vi.doMock("chrome-launcher", () => ({ launch }));
+    vi.doMock("../../src/browser/index.js", () => ({
+      acquireManualLoginChromeForRun,
+    }));
 
     const { recoverConversationTab } = await import("../../src/browser/recoverConversation.js");
     const recovered = await recoverConversationTab(meta, logger, {
@@ -57,18 +59,19 @@ describe("recoverConversationTab flow", () => {
       port: 9222,
       ref: "target-1",
     });
-    expect(launch).not.toHaveBeenCalled();
+    expect(acquireManualLoginChromeForRun).not.toHaveBeenCalled();
     expect(recovered.ref).toBe("target-1");
     expect(recovered.chrome).toBeNull();
   });
 
   test("launches the stored manual-login profile when the existing endpoint is gone", async () => {
-    const openChatGptTarget = vi.fn(async () => {
-      throw new Error("ECONNREFUSED");
-    });
+    const openChatGptTarget = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("ECONNREFUSED"))
+      .mockResolvedValueOnce("target-2");
     const harvestChatGptTab = vi.fn(async () => readyHarvest);
     const chrome = { port: 53999, kill: vi.fn(), process: { unref: vi.fn() } };
-    const launch = vi.fn(async () => chrome);
+    const acquireManualLoginChromeForRun = vi.fn(async () => ({ chrome }));
 
     vi.doMock("../../src/browser/liveTabs.js", () => ({
       extractConversationIdFromUrl: (url: string) =>
@@ -76,7 +79,9 @@ describe("recoverConversationTab flow", () => {
       openChatGptTarget,
       harvestChatGptTab,
     }));
-    vi.doMock("chrome-launcher", () => ({ launch }));
+    vi.doMock("../../src/browser/index.js", () => ({
+      acquireManualLoginChromeForRun,
+    }));
 
     const { recoverConversationTab } = await import("../../src/browser/recoverConversation.js");
     const recovered = await recoverConversationTab(meta, logger, {
@@ -84,10 +89,12 @@ describe("recoverConversationTab flow", () => {
       readyTimeoutMs: 1,
     });
 
-    expect(launch).toHaveBeenCalledWith(
-      expect.objectContaining({
-        userDataDir: "/tmp/recover-profile",
-      }),
+    expect(acquireManualLoginChromeForRun).toHaveBeenCalledWith(
+      "/tmp/recover-profile",
+      expect.objectContaining({ manualLogin: true }),
+      logger,
+      "sess-recover",
+      {},
     );
     expect(harvestChatGptTab).toHaveBeenLastCalledWith({
       host: "127.0.0.1",
@@ -101,7 +108,7 @@ describe("recoverConversationTab flow", () => {
   test("does not require a local profile when reopening through a recorded endpoint", async () => {
     const openChatGptTarget = vi.fn(async () => "target-1");
     const harvestChatGptTab = vi.fn(async () => readyHarvest);
-    const launch = vi.fn();
+    const acquireManualLoginChromeForRun = vi.fn();
     const remoteMeta = {
       ...meta,
       browser: {
@@ -120,7 +127,9 @@ describe("recoverConversationTab flow", () => {
       openChatGptTarget,
       harvestChatGptTab,
     }));
-    vi.doMock("chrome-launcher", () => ({ launch }));
+    vi.doMock("../../src/browser/index.js", () => ({
+      acquireManualLoginChromeForRun,
+    }));
 
     const { recoverConversationTab } = await import("../../src/browser/recoverConversation.js");
     const recovered = await recoverConversationTab(remoteMeta, logger, {
@@ -129,16 +138,17 @@ describe("recoverConversationTab flow", () => {
     });
 
     expect(recovered.chrome).toBeNull();
-    expect(launch).not.toHaveBeenCalled();
+    expect(acquireManualLoginChromeForRun).not.toHaveBeenCalled();
   });
 
   test("kills launched Chrome when recovered content never becomes ready", async () => {
-    const openChatGptTarget = vi.fn(async () => {
-      throw new Error("ECONNREFUSED");
-    });
+    const openChatGptTarget = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("ECONNREFUSED"))
+      .mockResolvedValueOnce("target-2");
     const harvestChatGptTab = vi.fn();
     const chrome = { port: 53999, kill: vi.fn(), process: { unref: vi.fn() } };
-    const launch = vi.fn(async () => chrome);
+    const acquireManualLoginChromeForRun = vi.fn(async () => ({ chrome }));
 
     vi.doMock("../../src/browser/liveTabs.js", () => ({
       extractConversationIdFromUrl: (url: string) =>
@@ -146,7 +156,9 @@ describe("recoverConversationTab flow", () => {
       openChatGptTarget,
       harvestChatGptTab,
     }));
-    vi.doMock("chrome-launcher", () => ({ launch }));
+    vi.doMock("../../src/browser/index.js", () => ({
+      acquireManualLoginChromeForRun,
+    }));
 
     const { recoverConversationTab } = await import("../../src/browser/recoverConversation.js");
     await expect(

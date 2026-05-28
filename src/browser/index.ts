@@ -2556,7 +2556,7 @@ async function _assertNavigatedToHttp(
   });
 }
 
-type BrowserChrome = LaunchedChrome & { host?: string };
+export type BrowserChrome = LaunchedChrome & { host?: string };
 
 function detachKeptChromeProcess(chrome: Pick<LaunchedChrome, "process">): void {
   try {
@@ -2566,7 +2566,7 @@ function detachKeptChromeProcess(chrome: Pick<LaunchedChrome, "process">): void 
   }
 }
 
-async function acquireManualLoginChromeForRun(
+export async function acquireManualLoginChromeForRun(
   userDataDir: string,
   config: ReturnType<typeof resolveBrowserConfig>,
   logger: BrowserLogger,
