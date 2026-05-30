@@ -641,6 +641,97 @@ describe("waitForDeepResearchCompletion", () => {
     }
   });
 
+  it("prefers a completed page target over an earlier in-progress one", async () => {
+    // A page can expose more than one Deep Research iframe target (e.g. a stale
+    // in-progress one attached before the completed report). Scanning must not
+    // return the first in-progress target and miss the later completed OOPIF.
+    mockRuntime.evaluate.mockResolvedValue({
+      result: {
+        value: {
+          finished: false,
+          stopVisible: false,
+          textLength: 0,
+          hasIframe: true,
+          hasActiveScopedResearch: false,
+        },
+      },
+    });
+
+    const listeners = new Map<string, (params: unknown, sessionId?: string) => void>();
+    const deepResearchUrl =
+      "https://connector_openai_deep_research.web-sandbox.oaiusercontent.com/";
+
+    const mockClient = {
+      on: vi.fn((event: string, listener: (params: unknown, sessionId?: string) => void) => {
+        listeners.set(event, listener);
+      }),
+      removeListener: vi.fn(),
+      send: vi.fn(async (method: string, params?: unknown, sessionId?: string) => {
+        if (method === "Target.setAutoAttach" && (params as { autoAttach?: boolean })?.autoAttach) {
+          // In-progress target attaches FIRST, completed target SECOND.
+          listeners.get("Target.attachedToTarget")?.({
+            sessionId: "incomplete-session",
+            targetInfo: { type: "iframe", url: deepResearchUrl },
+          });
+          listeners.get("Target.attachedToTarget")?.({
+            sessionId: "complete-session",
+            targetInfo: { type: "iframe", url: deepResearchUrl },
+          });
+          return {};
+        }
+        if (method === "Page.getFrameTree") {
+          return {
+            frameTree: { frame: { id: `${sessionId}-frame`, name: "root", url: deepResearchUrl } },
+          };
+        }
+        if (method === "Page.createIsolatedWorld") {
+          return { executionContextId: sessionId === "complete-session" ? 22 : 11 };
+        }
+        if (method === "Runtime.evaluate" && sessionId === "complete-session") {
+          return {
+            result: {
+              value: {
+                completed: true,
+                inProgress: false,
+                textLength: 80,
+                text: "REPORT_OK https://example.com/report",
+              },
+            },
+          };
+        }
+        if (method === "Runtime.evaluate" && sessionId === "incomplete-session") {
+          return {
+            result: {
+              value: { completed: false, inProgress: true, textLength: 12, text: undefined },
+            },
+          };
+        }
+        return {};
+      }),
+    };
+
+    // Bound the loop so a future regression (returning the in-progress target)
+    // fails fast via timeout instead of spinning.
+    let nowCalls = 0;
+    const dateNowSpy = vi.spyOn(Date, "now").mockImplementation(() => {
+      nowCalls += 1;
+      return nowCalls < 12 ? 1_000 : 2_000;
+    });
+    try {
+      const result = await waitForDeepResearchCompletion(
+        mockRuntime as never,
+        mockLogger,
+        100,
+        1,
+        undefined,
+        mockClient as never,
+      );
+      expect(result.text).toBe("REPORT_OK https://example.com/report");
+    } finally {
+      dateNowSpy.mockRestore();
+    }
+  });
+
   it("returns an OOPIF report via the target path during a scoped run when the main DOM has no assistant turn", async () => {
     // Regression: ChatGPT renders the Deep Research report inside an
     // out-of-process iframe that is invisible to the main page's frame tree.

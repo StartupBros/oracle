@@ -214,9 +214,18 @@ export async function waitForDeepResearchCompletion(
     const targetResult = client
       ? await readDeepResearchTargetResult(client).catch(() => null)
       : null;
-    const frameResult =
-      targetResult ??
-      (Page ? await readDeepResearchFrameResult(Runtime, Page).catch(() => null) : null);
+    // A completed target read is authoritative. If the target read is missing or
+    // only in-progress, still try the in-page frame path so an incomplete target
+    // read does not suppress a completed report there (legacy/inline rendering).
+    const inPageResult =
+      !targetResult?.completed && Page
+        ? await readDeepResearchFrameResult(Runtime, Page).catch(() => null)
+        : null;
+    const frameResult = targetResult?.completed
+      ? targetResult
+      : inPageResult?.completed
+        ? inPageResult
+        : (targetResult ?? inPageResult);
     // A target-confirmed completion read the live connector iframe directly, so
     // it is authoritative even when the main DOM exposes no assistant turn (the
     // report lives entirely in the OOPIF). The main-DOM hasActiveScopedResearch
@@ -438,16 +447,25 @@ async function readDeepResearchTargetResult(
       .catch(() => undefined);
     await delay(100);
 
+    // A page can expose more than one Deep Research iframe target (e.g. a stale
+    // in-progress one alongside the completed report). Always prefer a completed
+    // read; only fall back to the best in-progress/text-bearing read when no
+    // session reports completion, so we never miss a later completed OOPIF.
+    let best: DeepResearchFrameStatus | null = null;
     for (const sessionId of sessionIds) {
       const value = await readDeepResearchTargetSession(rawClient, sessionId);
       if (value?.completed) {
         return value;
       }
-      if (value?.inProgress || value?.textLength) {
-        return value;
+      if (
+        value &&
+        (value.inProgress || value.textLength) &&
+        (value.textLength ?? 0) >= (best?.textLength ?? 0)
+      ) {
+        best = value;
       }
     }
-    return null;
+    return best;
   } finally {
     await rawClient
       .send(
