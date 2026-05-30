@@ -436,6 +436,114 @@ describe("waitForDeepResearchCompletion", () => {
     );
   });
 
+  it("returns an OOPIF report via the target path during a scoped run when the main DOM has no assistant turn", async () => {
+    // Regression: ChatGPT renders the Deep Research report inside an
+    // out-of-process iframe that is invisible to the main page's frame tree.
+    // The main-DOM poll therefore shows no assistant turn and
+    // hasActiveScopedResearch=false, while the target-attach path reads the
+    // completed report directly. Both Page and client are passed (production
+    // shape) and the run is scoped (minTurnIndex>=0). The target-confirmed
+    // completion must be returned instead of hanging until timeout.
+    mockRuntime.evaluate.mockResolvedValue({
+      result: {
+        value: {
+          finished: false,
+          stopVisible: false,
+          textLength: 0,
+          hasIframe: true,
+          hasActiveScopedResearch: false,
+        },
+      },
+    });
+
+    const listeners = new Map<string, (params: unknown, sessionId?: string) => void>();
+    const mockClient = {
+      on: vi.fn((event: string, listener: (params: unknown, sessionId?: string) => void) => {
+        listeners.set(event, listener);
+      }),
+      removeListener: vi.fn(),
+      send: vi.fn(async (method: string, params?: unknown, sessionId?: string) => {
+        if (method === "Target.setAutoAttach") {
+          listeners.get("Target.attachedToTarget")?.({
+            sessionId: "deep-session",
+            targetInfo: {
+              type: "iframe",
+              url: "https://connector_openai_deep_research.web-sandbox.oaiusercontent.com/",
+            },
+          });
+          return {};
+        }
+        if (method === "Target.getTargets") {
+          return { targetInfos: [] };
+        }
+        if (method === "Page.getFrameTree" && sessionId === "deep-session") {
+          return {
+            frameTree: {
+              frame: {
+                id: "sandbox",
+                url: "https://connector_openai_deep_research.web-sandbox.oaiusercontent.com/",
+              },
+              childFrames: [
+                {
+                  frame: {
+                    id: "root-frame",
+                    name: "root",
+                    url: "https://connector_openai_deep_research.web-sandbox.oaiusercontent.com/",
+                  },
+                },
+              ],
+            },
+          };
+        }
+        if (method === "Page.createIsolatedWorld" && sessionId === "deep-session") {
+          return {
+            executionContextId: (params as { frameId?: string }).frameId === "root-frame" ? 12 : 11,
+          };
+        }
+        if (
+          method === "Runtime.evaluate" &&
+          sessionId === "deep-session" &&
+          (params as { contextId?: number }).contextId === 12
+        ) {
+          return {
+            result: {
+              value: {
+                completed: true,
+                inProgress: false,
+                textLength: 80,
+                text: "OOPIF_REPORT https://example.com/report",
+              },
+            },
+          };
+        }
+        return {};
+      }),
+    };
+
+    // Main page frame tree exposes no Deep Research frame (the OOPIF is hidden),
+    // so the in-page frame path can never find the report on its own.
+    const mockPage = {
+      getFrameTree: vi.fn().mockResolvedValue({
+        frameTree: {
+          frame: { id: "root", url: "https://chatgpt.com/" },
+          childFrames: [{ frame: { id: "blank", url: "about:blank" } }],
+        },
+      }),
+      createIsolatedWorld: vi.fn(),
+    };
+
+    const result = await waitForDeepResearchCompletion(
+      mockRuntime as never,
+      mockLogger,
+      60_000,
+      1,
+      mockPage as never,
+      mockClient as never,
+    );
+
+    expect(result.text).toBe("OOPIF_REPORT https://example.com/report");
+  });
+
   it("does not complete from an unscoped frame result during a scoped run", async () => {
     mockRuntime.evaluate.mockImplementation(async (params?: { contextId?: number }) => {
       if (typeof params?.contextId === "number") {

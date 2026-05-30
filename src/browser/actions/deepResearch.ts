@@ -203,16 +203,30 @@ export async function waitForDeepResearchCompletion(
       );
     }
 
-    const frameResult = Page
-      ? await readDeepResearchFrameResult(Runtime, Page).catch(() => null)
-      : client
-        ? await readDeepResearchTargetResult(client).catch(() => null)
-        : null;
+    // ChatGPT renders the Deep Research report inside an out-of-process,
+    // sandboxed iframe (connector_openai_deep_research.*.oaiusercontent.com),
+    // doubly nested and same-origin. That OOPIF does NOT appear in the main
+    // page's frame tree, so the in-page isolated-world path
+    // (readDeepResearchFrameResult) can never see it. The target-attach path
+    // (readDeepResearchTargetResult) attaches to the iframe's own CDP target and
+    // walks its nested frames, so it CAN read the report. Prefer the target path
+    // and fall back to the in-page frame path for legacy/inline rendering.
+    const targetResult = client
+      ? await readDeepResearchTargetResult(client).catch(() => null)
+      : null;
+    const frameResult =
+      targetResult ??
+      (Page ? await readDeepResearchFrameResult(Runtime, Page).catch(() => null) : null);
+    // A target-confirmed completion read the live connector iframe directly, so
+    // it is authoritative even when the main DOM exposes no assistant turn (the
+    // report lives entirely in the OOPIF). The main-DOM hasActiveScopedResearch
+    // heuristic no longer holds in that case, so don't gate on it.
+    const completedFromTarget = Boolean(targetResult?.completed);
     const scopedToNewTurns = minTurnLiteral >= 0;
     if (
       frameResult?.completed &&
       frameResult.text &&
-      (!scopedToNewTurns || val?.hasActiveScopedResearch)
+      (completedFromTarget || !scopedToNewTurns || val?.hasActiveScopedResearch)
     ) {
       logger(`Deep Research completed (${Math.round((Date.now() - start) / 1000)}s elapsed)`);
       return {
