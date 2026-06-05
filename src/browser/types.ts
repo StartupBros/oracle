@@ -33,6 +33,15 @@ export interface BrowserGeneratedImage {
   fileId?: string;
 }
 
+export interface BrowserDownloadableFile {
+  url: string;
+  downloadUrl?: string;
+  sandboxUrl?: string;
+  filename?: string;
+  label?: string;
+  mimeType?: string;
+}
+
 export interface SavedBrowserImage extends SessionArtifact {
   kind: "image";
   url: string;
@@ -41,6 +50,14 @@ export interface SavedBrowserImage extends SessionArtifact {
   width?: number;
   height?: number;
   fileId?: string;
+}
+
+export interface SavedBrowserFile extends SessionArtifact {
+  kind: "file";
+  url: string;
+  finalUrl?: string;
+  sandboxUrl?: string;
+  filename?: string;
 }
 
 export interface BrowserAutomationConfig {
@@ -138,6 +155,8 @@ export interface BrowserRunResult {
   artifacts?: SessionArtifact[];
   generatedImages?: BrowserGeneratedImage[];
   savedImages?: SavedBrowserImage[];
+  downloadableFiles?: BrowserDownloadableFile[];
+  savedFiles?: SavedBrowserFile[];
   archive?: BrowserArchiveResult;
   modelSelection?: BrowserModelSelectionEvidence;
   warnings?: BrowserRunWarning[];

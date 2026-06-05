@@ -167,6 +167,8 @@ Deep Research is browser-only. It does not use connected apps in v1; give it pub
 
 Completed browser sessions also save durable artifacts under `~/.oracle/sessions/<id>/artifacts/`. Deep Research writes the extracted report to `deep-research-report.md`, and every browser run writes `transcript.md` with the prompt, final answer, conversation URL, and saved artifact references. Use `--write-output <path>` when you also need a copy of just the final answer at a specific path.
 
+When ChatGPT generates downloadable files in the assistant response (for example a ZIP, wheel, source distribution, CSV, or PDF), Oracle saves those files beside the transcript before any archive attempt. The downloader is intentionally narrow: it only follows ChatGPT-owned file/download URLs from the assistant response and uses `sandbox:/mnt/data/...` links as source metadata and filename hints, not as arbitrary fetch targets. External links in the response are left in the transcript but are not downloaded.
+
 ### Conversation archiving
 
 Browser mode keeps the local session as the source of truth, so Oracle can optionally archive the ChatGPT conversation after a successful run. The default `--browser-archive auto` archives only successful non-project, non-Deep-Research, non-multi-turn one-shot chats after `transcript.md`, generated artifacts, the final answer, and the conversation URL are saved locally.

@@ -146,7 +146,7 @@ export interface BrowserMetadata {
 }
 
 export interface SessionArtifact {
-  kind: "transcript" | "deep-research-report" | "image";
+  kind: "transcript" | "deep-research-report" | "image" | "file";
   path: string;
   label?: string;
   mimeType?: string;

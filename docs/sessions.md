@@ -13,7 +13,7 @@ Every Oracle run gets an id, a slug, and a folder. You can list runs, render the
 ├── prompt.md                # assembled bundle (what was sent)
 ├── response.md              # the model's answer (when complete)
 ├── log.jsonl                # per-event log
-└── artifacts/               # browser-only: transcript, generated images, deep-research-report.md
+└── artifacts/               # browser-only: transcript, generated images/files, deep-research-report.md
 ```
 
 Override the root with `ORACLE_HOME_DIR=/some/path`.
