@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Browser: wait for the current ChatGPT Intelligence pill before falling back to the default thinking level. This lets `--browser-model-strategy current --browser-thinking-time extra-high` select and verify Extra High before submitting (thanks @alex-on-java).
+- Browser: wait for the current ChatGPT Intelligence pill before falling back to the default thinking level, and make `--browser-model-strategy select` prefer concrete requested variants over version-only submenu wrappers with bounded retries. This lets current-model runs select and verify Extra High before submitting and prevents explicit Instant selection from hanging (thanks @alex-on-java and @servrox).
 
 ## 0.14.1 — 2026-06-15
 

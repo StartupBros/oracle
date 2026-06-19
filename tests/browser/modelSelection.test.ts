@@ -215,6 +215,7 @@ const evaluateMenuModelSelectionExpression = async (
 const evaluateIntelligenceModelSelectionExpression = async (
   targetModel: string,
   initialButtonLabel = "Extra High",
+  includeInstant = true,
 ): Promise<unknown> => {
   class FakeEventTarget {
     dispatchEvent(_event: unknown): boolean {
@@ -330,11 +331,20 @@ const evaluateIntelligenceModelSelectionExpression = async (
     },
   );
   const initialIsPro = initialButtonLabel.toLowerCase().includes("pro");
+  const instantOption = new FakeElement(
+    "Instant",
+    { role: "menuitemradio", "aria-checked": "false" },
+    [],
+    () => {
+      proPillActive = false;
+      modelButton.textContent = "Instant";
+    },
+  );
   const intelligenceMenu = new FakeElement(
     "IntelligenceInstantMediumHighExtra HighPro ExtendedGPT-5.5",
     { role: "menu", "data-testid": "composer-intelligence-picker-content" },
     [
-      new FakeElement("Instant", { role: "menuitemradio", "aria-checked": "false" }),
+      ...(includeInstant ? [instantOption] : []),
       new FakeElement("Medium", { role: "menuitemradio", "aria-checked": "false" }),
       new FakeElement("High", { role: "menuitemradio", "aria-checked": "false" }),
       new FakeElement(
@@ -985,9 +995,10 @@ describe("browser model selection matchers", () => {
   it("hard-rejects non-Instant candidates when targeting Instant", () => {
     const expression = buildModelSelectionExpressionForTest("GPT-5.5 Instant");
     expect(expression).toContain("const candidateHasInstant =");
-    expect(expression).toContain(
-      "if (wantsInstant && !candidateHasInstant && !candidateSelectsDesiredVersion) return 0;",
-    );
+    expect(expression).toContain("const candidateOpensInstantSubmenu =");
+    expect(expression).toContain("const candidateSelectsConfiguredVersion =");
+    expect(expression).toContain("!candidateOpensInstantSubmenu &&");
+    expect(expression).toContain("!candidateSelectsConfiguredVersion");
   });
 
   it("selects the observed bare GPT-5.5 row when its label is Instant", async () => {
@@ -1341,6 +1352,22 @@ describe("browser model selection matchers", () => {
     await expect(evaluateIntelligenceModelSelectionExpression("Thinking 5.5")).resolves.toEqual({
       status: "already-selected",
       label: "Thinking 5.5",
+    });
+  });
+
+  it("prefers the concrete Instant row over the GPT-5.5 submenu wrapper", async () => {
+    await expect(evaluateIntelligenceModelSelectionExpression("GPT-5.5 Instant")).resolves.toEqual({
+      status: "switched",
+      label: "Instant",
+    });
+  });
+
+  it("bounds GPT-5.5 submenu retries when Instant is unavailable", async () => {
+    await expect(
+      evaluateIntelligenceModelSelectionExpression("GPT-5.5 Instant", "Extra High", false),
+    ).resolves.toMatchObject({
+      status: "option-not-found",
+      hint: { availableOptions: expect.arrayContaining(["GPT-5.5"]) },
     });
   });
 
