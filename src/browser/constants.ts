@@ -72,6 +72,11 @@ export const UPLOAD_STATUS_SELECTORS = [
 ];
 
 export const STOP_BUTTON_SELECTOR = '[data-testid="stop-button"]';
+export const STOP_BUTTON_SELECTORS = [
+  STOP_BUTTON_SELECTOR,
+  '[data-testid="composer-stop-button"]',
+  'button[aria-label*="stop" i]',
+];
 export const SEND_BUTTON_SELECTORS = [
   'button[data-testid="send-button"]',
   'button[data-testid*="composer-send"]',

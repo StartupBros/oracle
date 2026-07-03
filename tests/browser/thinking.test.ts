@@ -158,12 +158,16 @@ function matchesSelectorList(node: FakeElement, selector: string): boolean {
 }
 
 function matchesSimpleSelector(node: FakeElement, selector: string): boolean {
-  const tagMatch = selector.match(/^[a-z]+/i);
+  const caseInsensitiveAttrs = new Set(
+    [...selector.matchAll(/\[([a-zA-Z0-9_-]+)[^\]]*\s+i\]/g)].map((match) => match[1]),
+  );
+  const normalizedSelector = selector.replace(/\s+i\]/g, "]");
+  const tagMatch = normalizedSelector.match(/^[a-z]+/i);
   if (tagMatch && node.tagName.toLowerCase() !== tagMatch[0].toLowerCase()) {
     return false;
   }
 
-  const classMatches = [...selector.matchAll(/\.([a-zA-Z0-9_-]+)/g)];
+  const classMatches = [...normalizedSelector.matchAll(/\.([a-zA-Z0-9_-]+)/g)];
   for (const match of classMatches) {
     if (!node.className.split(/\s+/).includes(match[1] ?? "")) {
       return false;
@@ -171,17 +175,22 @@ function matchesSimpleSelector(node: FakeElement, selector: string): boolean {
   }
 
   const attrMatches = [
-    ...selector.matchAll(/\[([a-zA-Z0-9_-]+)([*^]?=)?(?:"([^"]*)"|'([^']*)'|([^\]]+))?\]/g),
+    ...normalizedSelector.matchAll(
+      /\[([a-zA-Z0-9_-]+)([*^]?=)?(?:"([^"]*)"|'([^']*)'|([^\]]+))?\]/g,
+    ),
   ];
   for (const match of attrMatches) {
     const attr = match[1] ?? "";
     const operator = match[2];
     const expected = match[3] ?? match[4] ?? match[5] ?? "";
-    const actual = node.getAttribute(attr);
+    const rawActual = node.getAttribute(attr);
+    const insensitive = caseInsensitiveAttrs.has(attr);
+    const actual = insensitive ? rawActual?.toLowerCase() : rawActual;
+    const comparableExpected = insensitive ? expected.toLowerCase() : expected;
     if (!operator && actual == null) return false;
-    if (operator === "=" && actual !== expected) return false;
-    if (operator === "*=" && !String(actual ?? "").includes(expected)) return false;
-    if (operator === "^=" && !String(actual ?? "").startsWith(expected)) return false;
+    if (operator === "=" && actual !== comparableExpected) return false;
+    if (operator === "*=" && !String(actual ?? "").includes(comparableExpected)) return false;
+    if (operator === "^=" && !String(actual ?? "").startsWith(comparableExpected)) return false;
   }
 
   return true;
@@ -490,20 +499,36 @@ describe("thinking status browser expression", () => {
     expect(result).toBeNull();
   });
 
-  test("falls back to the visible stop control when no thinking indicator matches", async () => {
+  test.each([
+    { "data-testid": "stop-button" },
+    { "data-testid": "composer-stop-button" },
+    { "aria-label": "Stop streaming" },
+  ] as Record<string, string>[])(
+    "falls back to a visible stop control when no thinking indicator matches: %o",
+    async (attrs) => {
+      const document = new FakeDocument();
+      const composer = new FakeElement("div", "", { "data-testid": "composer-footer-actions" });
+      composer.append(new FakeElement("button", "", attrs));
+      document.append(composer);
+
+      const result = await runThinkingStatusExpression(document);
+
+      expect(result).toEqual({ message: "response streaming", source: "inline" });
+    },
+  );
+
+  test("ignores a hidden stop control", async () => {
     const document = new FakeDocument();
-    const composer = new FakeElement("div", "", { "data-testid": "composer-footer-actions" });
-    composer.append(
-      new FakeElement("button", "", {
-        "data-testid": "stop-button",
-        "aria-label": "Stop streaming",
-      }),
+    document.append(
+      new FakeElement(
+        "button",
+        "",
+        { "data-testid": "composer-stop-button" },
+        visibleRect({ width: 0 }),
+      ),
     );
-    document.append(composer);
 
-    const result = await runThinkingStatusExpression(document);
-
-    expect(result).toEqual({ message: "response streaming", source: "inline" });
+    await expect(runThinkingStatusExpression(document)).resolves.toBeNull();
   });
 
   test("prefers a thinking indicator over the stop control fallback", async () => {

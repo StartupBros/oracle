@@ -3,7 +3,7 @@ import { formatElapsed } from "../../oracle/format.js";
 import {
   ASSISTANT_ROLE_SELECTOR,
   CONVERSATION_TURN_SELECTOR,
-  STOP_BUTTON_SELECTOR,
+  STOP_BUTTON_SELECTORS,
 } from "../constants.js";
 
 const THINKING_STALE_HINT_MS = 10 * 60_000;
@@ -199,20 +199,16 @@ function buildThinkingStatusExpression(): string {
     '[aria-live="polite"]',
   ];
   const keywords = ["pro thinking", "thinking", "reasoning"];
-  const stopSelectors = [
-    STOP_BUTTON_SELECTOR,
-    '[data-testid="composer-stop-button"]',
-    'button[aria-label*="stop" i]',
-  ];
+  const stopSelector = STOP_BUTTON_SELECTORS.join(", ");
   const selectorLiteral = JSON.stringify(selectors);
   const keywordsLiteral = JSON.stringify(keywords);
-  const stopSelectorsLiteral = JSON.stringify(stopSelectors);
+  const stopSelectorLiteral = JSON.stringify(stopSelector);
   return `(async () => {
     const CONVERSATION_SELECTOR = ${conversationLiteral};
     const ASSISTANT_SELECTOR = ${assistantLiteral};
     const selectors = ${selectorLiteral};
     const keywords = ${keywordsLiteral};
-    const stopSelectors = ${stopSelectorsLiteral};
+    const stopSelector = ${stopSelectorLiteral};
     const normalize = (value) =>
       String(value || '')
         .normalize('NFD')
@@ -437,8 +433,8 @@ function buildThinkingStatusExpression(): string {
     // reads as "dead" downstream. The stop/interrupt control is a stable,
     // language-independent signal that generation is active; it lives in the
     // composer, so isComposerAdjacent must not filter it.
-    const stopVisible = stopSelectors.some((selector) =>
-      Array.from(document.querySelectorAll(selector)).some((node) => isVisible(node)),
+    const stopVisible = Array.from(document.querySelectorAll(stopSelector)).some((node) =>
+      isVisible(node),
     );
     if (stopVisible) {
       return {
