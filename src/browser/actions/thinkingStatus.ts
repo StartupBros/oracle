@@ -542,6 +542,47 @@ export function buildThinkingActivePredicateJs(fnName: string): string {
       if (!(node instanceof HTMLElement) || !isVisible(node)) continue;
       if (isActiveLabel(node.textContent) || isActiveLabel(node.getAttribute('aria-label'))) return true;
     }
+    // 5) A live progress bar (determinate or indeterminate) is active generation, even when no
+    //    label or shimmer is present (some connector/tool phases surface only a progress bar).
+    const hasLiveProgress = (scope) => {
+      let nodes;
+      try {
+        nodes = scope.querySelectorAll('progress, [role="progressbar"], [aria-valuenow], [data-testid*="progress"]');
+      } catch { return false; }
+      return Array.from(nodes).some((n) => {
+        if (!(n instanceof HTMLElement) || !isVisible(n)) return false;
+        if (n.getAttribute('aria-valuenow') != null) return true;
+        if (n instanceof HTMLProgressElement) return true;
+        return String(n.getAttribute('role') || '').toLowerCase() === 'progressbar';
+      });
+    };
+    if (hasLiveProgress(document)) return true;
+    // 6) A visible thinking/reasoning sidecar panel (the connector/reasoning phase is often
+    //    exposed ONLY through a right-side panel with no inline label). Match the existing
+    //    thinking-monitor heuristic: a right-side panel that looks like thinking, or any such
+    //    container that carries a live progress bar. Presence alone is NOT enough (a collapsed
+    //    reasoning summary persists post-completion); require the thinking cue or live progress.
+    const looksLikeThinking = (node) => {
+      const label = norm([
+        node.textContent,
+        node.getAttribute?.('aria-label'),
+        node.getAttribute?.('data-testid'),
+      ].filter(Boolean).join(' '));
+      if (label.startsWith('thought for')) return false;
+      return label.includes('thinking') || label.includes('reasoning') || label.includes('pro thinking');
+    };
+    let panels;
+    try {
+      panels = document.querySelectorAll(
+        'aside, [role="complementary"], [role="dialog"], [data-testid*="thinking"], [data-testid*="reasoning"], [class*="sidecar"], [class*="sidebar"]',
+      );
+    } catch { panels = []; }
+    for (const node of Array.from(panels)) {
+      if (!(node instanceof HTMLElement) || !isVisible(node)) continue;
+      const rect = node.getBoundingClientRect();
+      const rightSide = rect.left >= window.innerWidth * 0.35 && rect.width >= 180 && rect.height >= 120;
+      if (hasLiveProgress(node) || (rightSide && looksLikeThinking(node))) return true;
+    }
     return false;
   };`;
 }

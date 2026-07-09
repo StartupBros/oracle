@@ -57,22 +57,33 @@ const TERMINAL_GATE_CONFIG: TerminalGateConfig = {
 };
 
 export interface TerminalGateState {
-  maxLen: number;
-  lastGrowthAt: number;
+  lastKey: string;
+  lastChangeAt: number;
   lastDisturbanceAt: number;
   barStableCycles: number;
+  seen: boolean;
 }
 
 export interface TerminalSample {
   now: number;
   len: number;
+  // A fingerprint of the current answer (its text, ideally plus turn/message identity). ANY
+  // change (not just a length increase) is treated as the turn still moving: an equal-length
+  // or shorter rewrite, or a preamble replaced by the answer, resets the stability clocks.
+  contentKey: string;
   stopVisible: boolean;
   barVisible: boolean;
   thinkingActive: boolean;
 }
 
 export function createTerminalGateState(now: number): TerminalGateState {
-  return { maxLen: 0, lastGrowthAt: now, lastDisturbanceAt: now, barStableCycles: 0 };
+  return {
+    lastKey: "",
+    lastChangeAt: now,
+    lastDisturbanceAt: now,
+    barStableCycles: 0,
+    seen: false,
+  };
 }
 
 // Pure, unit-testable per-cycle classifier. Feed it one sample every poll; when it returns
@@ -82,25 +93,36 @@ export function classifyTurnTerminal(
   sample: TerminalSample,
   config: TerminalGateConfig,
 ): { state: TerminalGateState; terminal: boolean } {
-  const grew = sample.len > state.maxLen;
-  const maxLen = grew ? sample.len : state.maxLen;
-  const lastGrowthAt = grew ? sample.now : state.lastGrowthAt;
-  const disturbed = grew || sample.stopVisible || sample.thinkingActive;
+  const changed = !state.seen || sample.contentKey !== state.lastKey;
+  const lastChangeAt = changed ? sample.now : state.lastChangeAt;
+  const disturbed = changed || sample.stopVisible || sample.thinkingActive;
   const lastDisturbanceAt = disturbed ? sample.now : state.lastDisturbanceAt;
   // proofA debounce: intentionally NOT gated on !thinkingActive, so a debounced action bar
   // proves completion even if a stale/false-positive thinking signal lingers (a finished turn
-  // can keep a reasoning panel mounted). Only proofB is vetoed by thinkingActive.
+  // can keep a reasoning panel mounted). It resets on ANY content change so a bar that appears
+  // while the answer is still rendering (the transient-bar / first-tokens race) cannot finalize.
   const barStableCycles =
-    sample.barVisible && !sample.stopVisible && !grew ? state.barStableCycles + 1 : 0;
-  const next: TerminalGateState = { maxLen, lastGrowthAt, lastDisturbanceAt, barStableCycles };
+    sample.barVisible && !sample.stopVisible && !changed ? state.barStableCycles + 1 : 0;
+  const next: TerminalGateState = {
+    lastKey: sample.contentKey,
+    lastChangeAt,
+    lastDisturbanceAt,
+    barStableCycles,
+    seen: true,
+  };
 
   let terminal = false;
   if (!sample.stopVisible && sample.len > 0) {
     const quietMs = sample.now - lastDisturbanceAt;
-    const stableMs = sample.now - lastGrowthAt;
-    // proofA — debounced action bar; bypasses the thinking veto (a present, debounced bar is
-    // stronger positive proof than any panel heuristic, and must not hang on a lingering panel).
-    const barProof = sample.barVisible && barStableCycles >= config.barConfirmCycles;
+    const stableMs = sample.now - lastChangeAt;
+    // proofA — debounced action bar AND content stable for a minimum time. The time-stability
+    // requirement guards the documented race where finished-action controls surface while only
+    // the first tokens have rendered. Not vetoed by thinkingActive (a debounced+stable bar must
+    // not hang on a stale reasoning panel), but a still-changing answer keeps stableMs at zero.
+    const barProof =
+      sample.barVisible &&
+      barStableCycles >= config.barConfirmCycles &&
+      stableMs >= config.minStableMs;
     // proofB — generous quiet with no active thinking; the selector-drift-safe fallback.
     // Withheld for implausibly short captures, which must be proven by the action bar.
     const quietProof =
@@ -645,6 +667,9 @@ async function pollAssistantCompletion(
         {
           now: Date.now(),
           len: normalized.text.length,
+          // Fingerprint = turn/message identity + the full text, so a same-length rewrite, a
+          // shorter final answer replacing a longer preamble, or a new turn all count as change.
+          contentKey: `${normalized.meta.messageId ?? normalized.meta.turnId ?? ""}::${normalized.text}`,
           stopVisible,
           barVisible,
           thinkingActive,

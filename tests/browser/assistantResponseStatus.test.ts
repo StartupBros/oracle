@@ -158,6 +158,9 @@ describe("classifyTurnTerminal", () => {
       const sample: TerminalSample = {
         now,
         len: partial.len,
+        // Default fingerprint = the length, so a changing length reads as "still moving"; tests
+        // that need an equal-length rewrite pass an explicit contentKey.
+        contentKey: partial.contentKey ?? String(partial.len),
         stopVisible: partial.stopVisible ?? false,
         barVisible: partial.barVisible ?? false,
         thinkingActive: partial.thinkingActive ?? false,
@@ -224,6 +227,31 @@ describe("classifyTurnTerminal", () => {
     expect(out.at(-1)).toBe(true);
   });
 
+  test("proofA does NOT finalize a transient bar while the answer is still rendering", () => {
+    // Repo history: finished-action controls can surface while only the first tokens exist.
+    // The bar is present the whole time, but the text keeps changing, so proofA must not fire.
+    const out = runGate([
+      { len: 4, barVisible: true },
+      { len: 8, barVisible: true },
+      { len: 12, barVisible: true },
+      { len: 40, barVisible: true },
+      { len: 90, barVisible: true },
+    ]);
+    expect(out.some(Boolean)).toBe(false);
+  });
+
+  test("any content change (even equal length) resets the stability clocks", () => {
+    // An equal-length rewrite (preamble replaced by an answer of the same length) must reset:
+    // length-only tracking would have treated it as stable and could finalize mid-rewrite.
+    const out = runGate([
+      { len: 200, barVisible: true, contentKey: "preamble-aaaaaaaaaaaaaaaaaaaa" },
+      { len: 200, barVisible: true, contentKey: "answer-bbbbbbbbbbbbbbbbbbbbbb" }, // same len, new text
+      { len: 200, barVisible: true, contentKey: "answer-bbbbbbbbbbbbbbbbbbbbbb" },
+    ]);
+    // The rewrite at sample 1 resets the debounce; only ~1 stable cycle follows -> not terminal.
+    expect(out.some(Boolean)).toBe(false);
+  });
+
   test("proofB: a bar-drifted answer finalizes after the quiet window with no thinking", () => {
     const samples: Array<Partial<TerminalSample> & { len: number }> = [
       { len: 800, stopVisible: true },
@@ -276,15 +304,19 @@ describe("classifyTurnTerminal", () => {
 
 describe("thinking-active completion veto", () => {
   class FakeEl {
+    public rect = { left: 0, top: 0, width: 120, height: 40 };
     constructor(
       public textContent = "",
       private attrs: Record<string, string> = {},
     ) {}
     getBoundingClientRect() {
-      return { width: 120, height: 40 };
+      return this.rect;
     }
     getAttribute(name: string): string | null {
       return this.attrs[name] ?? null;
+    }
+    querySelectorAll() {
+      return [];
     }
   }
 
@@ -293,14 +325,21 @@ describe("thinking-active completion veto", () => {
     shimmer?: boolean;
     ariaBusy?: boolean;
     statusText?: string;
+    progress?: boolean;
+    panel?: FakeEl;
   }): boolean {
     const predicate = buildThinkingActivePredicateJsForTest("isThinkingActive");
     const statusNodes = opts.statusText != null ? [new FakeEl(opts.statusText)] : [];
+    const progressNodes = opts.progress
+      ? [new FakeEl("", { "aria-valuenow": "40", role: "progressbar" })]
+      : [];
+    const panelNodes = opts.panel ? [opts.panel] : [];
     const context = createContext({
       Array,
       Number,
       String,
       HTMLElement: FakeEl,
+      HTMLProgressElement: class {},
       document: {
         querySelectorAll: (selector: string) => {
           if (selector.includes("stop") || selector.includes('aria-label*="stop"')) {
@@ -308,6 +347,19 @@ describe("thinking-active completion veto", () => {
           }
           if (selector.includes("loading-shimmer")) return opts.shimmer ? [new FakeEl()] : [];
           if (selector.includes("aria-busy")) return opts.ariaBusy ? [new FakeEl()] : [];
+          if (selector.includes("progressbar") || selector.includes("aria-valuenow")) {
+            return progressNodes;
+          }
+          // The panel selector carries "aside"/"complementary"/"sidecar"; the status selector
+          // does not, so match panels first to disambiguate (both mention thinking/reasoning).
+          if (
+            selector.includes("aside") ||
+            selector.includes("complementary") ||
+            selector.includes("sidecar") ||
+            selector.includes("sidebar")
+          ) {
+            return panelNodes;
+          }
           if (
             selector.includes("thinking") ||
             selector.includes("reasoning") ||
@@ -351,6 +403,22 @@ describe("thinking-active completion veto", () => {
     // The headline hang the design must avoid: this summary lingers in the DOM on every
     // finished Pro turn and on reattach. A presence-based veto would hang forever here.
     expect(evalThinkingActive({ statusText: "Thought for 12s" })).toBe(false);
+  });
+
+  test("fires on a live progress bar as the sole liveness signal (progress-only sidecar)", () => {
+    expect(evalThinkingActive({ progress: true })).toBe(true);
+  });
+
+  test("fires on a right-side reasoning sidecar panel with no inline label", () => {
+    const panel = new FakeEl("Reasoning");
+    panel.rect = { left: 1000, top: 100, width: 380, height: 400 }; // right side, large
+    expect(evalThinkingActive({ panel })).toBe(true);
+  });
+
+  test("does NOT fire on a completed 'Thought for Xs' sidecar (past-tense, not active)", () => {
+    const panel = new FakeEl("Thought for 12s");
+    panel.rect = { left: 1000, top: 100, width: 380, height: 400 };
+    expect(evalThinkingActive({ panel })).toBe(false);
   });
 
   test("does NOT fire on an idle DOM (finished, no controls)", () => {
