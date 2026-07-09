@@ -833,22 +833,39 @@ describe("ensureLoggedIn", () => {
 
 describe("waitForAssistantResponse", () => {
   test("returns captured assistant payload", async () => {
-    const runtime = {
-      evaluate: vi.fn().mockResolvedValue({
-        result: {
-          type: "object",
-          value: {
-            text: "Answer to the question.",
-            html: "<p>Answer to the question.</p>",
-            messageId: "mid",
-            turnId: "tid",
-          },
-        },
-      }),
-    } as unknown as ChromeClient["Runtime"];
-    const result = await waitForAssistantResponse(runtime, 1000, logger);
-    expect(result.text).toBe("Answer to the question.");
-    expect(result.meta).toEqual({ messageId: "mid", turnId: "tid" });
+    vi.useFakeTimers();
+    try {
+      const payload = {
+        text: "Answer to the question.",
+        html: "<p>Answer to the question.</p>",
+        messageId: "mid",
+        turnId: "tid",
+      };
+      const evaluate = vi
+        .fn()
+        .mockImplementation(async (params: { expression?: string; awaitPromise?: boolean }) => {
+          if (params?.awaitPromise) {
+            return { result: { type: "object", value: payload } };
+          }
+          const expression = String(params?.expression ?? "");
+          if (expression.includes("extractAssistantTurn")) {
+            return { result: { value: payload } };
+          }
+          // A finished turn's action bar is present -> the terminal gate proves completion (proofA).
+          if (expression.includes("Find the LAST assistant turn")) {
+            return { result: { value: true } };
+          }
+          return { result: { value: false } };
+        });
+      const runtime = { evaluate } as unknown as ChromeClient["Runtime"];
+      const promise = waitForAssistantResponse(runtime, 30_000, logger);
+      await vi.advanceTimersByTimeAsync(4_000);
+      const result = await promise;
+      expect(result.text).toBe("Answer to the question.");
+      expect(result.meta).toEqual({ messageId: "mid", turnId: "tid" });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   test("aborts poller when evaluation wins (no background polling)", async () => {
@@ -880,15 +897,20 @@ describe("waitForAssistantResponse", () => {
             }
             return { result: { value: payload } };
           }
+          if (expression.includes("Find the LAST assistant turn")) {
+            return { result: { value: true } }; // action bar present -> proofA
+          }
           return { result: { value: false } };
         });
 
       const runtime = { evaluate } as unknown as ChromeClient["Runtime"];
       const promise = waitForAssistantResponse(runtime, 30_000, logger);
-      await vi.advanceTimersByTimeAsync(2_000);
+      await vi.advanceTimersByTimeAsync(4_000);
       const result = await promise;
       expect(result.text).toBe(answerText);
 
+      // The confirm re-poll is FOREGROUND; once the promise resolves there must be no further
+      // (background) polling — the poller is aborted when the evaluation path wins.
       const callsAtReturn = evaluate.mock.calls.length;
       await vi.advanceTimersByTimeAsync(5_000);
       expect(evaluate.mock.calls.length).toBe(callsAtReturn);
@@ -915,14 +937,17 @@ describe("waitForAssistantResponse", () => {
             return { result: { type: "object", value: partial } };
           }
           const expression = String(params.expression ?? "");
+          // The stub "I" is captured mid-stream; the full answer and its action bar arrive at 3.5s.
+          const done = Date.now() - startedAt >= 3_500;
           if (expression.includes("extractAssistantTurn")) {
             snapshotCalls += 1;
             if (snapshotCalls === 1) {
               await new Promise((resolve) => setTimeout(resolve, 50));
             }
-            return {
-              result: { value: Date.now() - startedAt < 3_500 ? partial : complete },
-            };
+            return { result: { value: done ? complete : partial } };
+          }
+          if (expression.includes("Find the LAST assistant turn")) {
+            return { result: { value: done } }; // action bar only once the turn finishes
           }
           return { result: { value: false } };
         });
@@ -934,10 +959,8 @@ describe("waitForAssistantResponse", () => {
       );
       await vi.advanceTimersByTimeAsync(12_000);
 
+      // The short stub must NOT be finalized; the grown, bar-proven answer is returned.
       await expect(promise).resolves.toMatchObject({ text: complete.text });
-      expect(logger).toHaveBeenCalledWith(
-        "Captured an implausibly short response; confirming it is not a mid-stream capture",
-      );
     } finally {
       vi.useRealTimers();
     }
@@ -1031,8 +1054,9 @@ describe("waitForAssistantResponse", () => {
             }
             return { result: { value: snapshotCalls <= 5 ? partial : complete } };
           }
+          // Still rendering while the first paragraph shows: no action bar until the turn finishes.
           if (expression.includes("Find the LAST assistant turn")) {
-            return { result: { value: true } };
+            return { result: { value: snapshotCalls > 5 } };
           }
           return { result: { value: false } };
         });
@@ -1042,12 +1066,10 @@ describe("waitForAssistantResponse", () => {
         30_000,
         logger,
       );
-      await vi.advanceTimersByTimeAsync(10_000);
+      await vi.advanceTimersByTimeAsync(12_000);
 
+      // The long-but-partial first paragraph must not be finalized; the full answer is returned.
       await expect(promise).resolves.toMatchObject({ text: complete.text });
-      expect(logger).toHaveBeenCalledWith(
-        "Completion controls surfaced; confirming stable assistant response",
-      );
     } finally {
       vi.useRealTimers();
     }
@@ -1078,12 +1100,10 @@ describe("waitForAssistantResponse", () => {
         30_000,
         logger,
       );
-      await vi.advanceTimersByTimeAsync(15_000);
+      await vi.advanceTimersByTimeAsync(6_000);
 
+      // A legitimately short answer is kept once its action bar proves completion (proofA).
       await expect(promise).resolves.toMatchObject({ text: "Yes." });
-      expect(logger).toHaveBeenCalledWith(
-        "Completion controls surfaced; confirming stable assistant response",
-      );
     } finally {
       vi.useRealTimers();
     }
@@ -1119,10 +1139,8 @@ describe("waitForAssistantResponse", () => {
         if (params?.awaitPromise) {
           throw new Error("observer failed");
         }
-        if (
-          typeof params?.expression === "string" &&
-          params.expression.includes("extractAssistantTurn")
-        ) {
+        const expression = typeof params?.expression === "string" ? params.expression : "";
+        if (expression.includes("extractAssistantTurn")) {
           return {
             result: {
               value: {
@@ -1134,10 +1152,14 @@ describe("waitForAssistantResponse", () => {
             },
           };
         }
+        // Recovered turn is finished (action bar present) -> the terminal gate confirms it.
+        if (expression.includes("Find the LAST assistant turn")) {
+          return { result: { value: true } };
+        }
         return { result: { value: null } };
       });
     const runtime = { evaluate } as unknown as ChromeClient["Runtime"];
-    const result = await waitForAssistantResponse(runtime, 200, logger);
+    const result = await waitForAssistantResponse(runtime, 10_000, logger);
     expect(result.text).toBe("Recovered assistant response.");
     expect(evaluate).toHaveBeenCalled();
   });
