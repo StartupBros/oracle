@@ -63,20 +63,29 @@ function isDeepResearchBrowserSession(metadata: SessionMetadata): boolean {
   return metadata.mode === "browser" && metadata.browser?.config?.researchMode === "deep";
 }
 
-function isDeepResearchPlaceholderCapture(metadata: SessionMetadata, logText: string): boolean {
+const DEEP_RESEARCH_TOOL_CALL_MARKERS = [
+  "called tool",
+  "used tool",
+  "użyto narzędzia",
+  "narzędzie wywołane",
+];
+
+export function isDeepResearchPlaceholderCapture(
+  metadata: SessionMetadata,
+  logText: string,
+): boolean {
   const answer = trimBeforeFirstAnswer(logText)
     .replace(/^Answer:\s*/i, "")
     .toLowerCase()
     .replace(/\s+/g, " ")
     .trim();
-  const isToolOnly =
-    answer === "called tool" ||
-    answer === "used tool" ||
-    answer === "użyto narzędzia" ||
-    answer === "narzędzie wywołane";
-  const modelUsage = metadata.models?.find((run) => run.model === metadata.model)?.usage;
-  const outputTokens = metadata.usage?.outputTokens ?? modelUsage?.outputTokens;
-  return isToolOnly && (outputTokens == null || outputTokens <= 8);
+  // A capture whose answer begins with a tool-call marker is a placeholder, not the
+  // report. This covers the bare stub ("called tool", a handful of tokens) and the
+  // ChatGPT "Deep Research App" connector's multi-line tool-call wrapper
+  // ("Called tool / Deep Research App / ... Response { session_id: ... }"). The wrapper
+  // is longer than the old outputTokens<=8 gate allowed, so match structurally on the
+  // leading marker instead of by exact text and token count.
+  return DEEP_RESEARCH_TOOL_CALL_MARKERS.some((marker) => answer.startsWith(marker));
 }
 
 async function writeReattachAnswer(
