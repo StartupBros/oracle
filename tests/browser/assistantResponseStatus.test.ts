@@ -326,13 +326,22 @@ describe("thinking-active completion veto", () => {
     ariaBusy?: boolean;
     statusText?: string;
     progress?: boolean;
+    progressNow?: number;
+    progressMax?: number;
     panel?: FakeEl;
   }): boolean {
     const predicate = buildThinkingActivePredicateJsForTest("isThinkingActive");
     const statusNodes = opts.statusText != null ? [new FakeEl(opts.statusText)] : [];
-    const progressNodes = opts.progress
-      ? [new FakeEl("", { "aria-valuenow": "40", role: "progressbar" })]
-      : [];
+    const progressAttrs: Record<string, string> =
+      opts.progressNow != null
+        ? {
+            "aria-valuenow": String(opts.progressNow),
+            "aria-valuemax": String(opts.progressMax ?? 100),
+            role: "progressbar",
+          }
+        : { "aria-valuenow": "40", role: "progressbar" };
+    const progressNodes =
+      opts.progress || opts.progressNow != null ? [new FakeEl("", progressAttrs)] : [];
     const panelNodes = opts.panel ? [opts.panel] : [];
     const context = createContext({
       Array,
@@ -407,6 +416,11 @@ describe("thinking-active completion veto", () => {
 
   test("fires on a live progress bar as the sole liveness signal (progress-only sidecar)", () => {
     expect(evalThinkingActive({ progress: true })).toBe(true);
+  });
+
+  test("does NOT fire on a completed progress bar (value at max)", () => {
+    // A finished connector bar must not veto completion forever.
+    expect(evalThinkingActive({ progressNow: 100, progressMax: 100 })).toBe(false);
   });
 
   test("fires on a right-side reasoning sidecar panel with no inline label", () => {

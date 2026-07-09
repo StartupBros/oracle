@@ -546,14 +546,26 @@ export function buildThinkingActivePredicateJs(fnName: string): string {
     //    label or shimmer is present (some connector/tool phases surface only a progress bar).
     const hasLiveProgress = (scope) => {
       let nodes;
+      // Only genuine progress indicators — NOT generic [aria-valuenow] range widgets (sliders,
+      // spinbuttons), which are not liveness signals and would falsely veto completion forever.
       try {
-        nodes = scope.querySelectorAll('progress, [role="progressbar"], [aria-valuenow], [data-testid*="progress"]');
+        nodes = scope.querySelectorAll('progress, [role="progressbar"]');
       } catch { return false; }
       return Array.from(nodes).some((n) => {
         if (!(n instanceof HTMLElement) || !isVisible(n)) return false;
-        if (n.getAttribute('aria-valuenow') != null) return true;
-        if (n instanceof HTMLProgressElement) return true;
-        return String(n.getAttribute('role') || '').toLowerCase() === 'progressbar';
+        if (n instanceof HTMLProgressElement) {
+          // Determinate <progress> is active only while it has not reached its max.
+          if (Number.isFinite(n.value) && Number.isFinite(n.max) && n.max > 0) return n.value < n.max;
+          return true; // indeterminate
+        }
+        const rawNow = n.getAttribute('aria-valuenow');
+        if (rawNow != null) {
+          const now = Number(rawNow);
+          const rawMax = n.getAttribute('aria-valuemax');
+          const max = rawMax != null && Number.isFinite(Number(rawMax)) ? Number(rawMax) : 100;
+          return Number.isFinite(now) ? now < max : true;
+        }
+        return true; // role=progressbar with no value -> indeterminate -> active
       });
     };
     if (hasLiveProgress(document)) return true;
