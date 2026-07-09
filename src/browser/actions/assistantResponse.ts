@@ -8,6 +8,7 @@ import {
   STOP_BUTTON_SELECTORS,
 } from "../constants.js";
 import { buildConversationTurnListExpression } from "../conversationTurns.js";
+import { buildThinkingActivePredicateJs, isThinkingActive } from "./thinkingStatus.js";
 import { delay } from "../utils.js";
 import {
   logDomFailure,
@@ -18,21 +19,97 @@ import { buildClickDispatcher } from "./domEvents.js";
 
 const ASSISTANT_POLL_TIMEOUT_ERROR = "assistant-response-watchdog-timeout";
 const STOP_CONTROL_SELECTOR = STOP_BUTTON_SELECTORS.join(", ");
+// Still used by the in-page settle heuristic's length buckets (see buildResponseObserverExpression).
 const MIN_CONFIDENT_ANSWER_LENGTH = 16;
 
-function isImplausiblyShortAnswer(candidateLength: number): boolean {
-  return candidateLength > 0 && candidateLength < MIN_CONFIDENT_ANSWER_LENGTH;
+function readPositiveIntEnv(name: string, fallback: number): number {
+  const raw = Number(process.env[name]);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : fallback;
 }
 
-export function shouldConfirmAssistantCompletion(args: {
-  candidateLength: number;
+// Terminal-completion gate. A turn is finalized only on POSITIVE proof it is done — never on
+// the mere "stop control absent + text stable" inference, which a settled GPT-5.5 Pro preamble
+// satisfies during the brief gap before it enters its thinking/tool phase.
+//   proofA: the finished-action bar is present for barConfirmCycles consecutive quiet cycles
+//           (debounces the transient mid-thinking action-bar flash). A debounced bar is the
+//           strongest positive signal, so it is NOT vetoed by thinking activity.
+//   proofB: a generous continuous-quiet window with NO active thinking and NO text growth —
+//           the drift-safe fallback that also recovers an answer whose action-bar selector drifted.
+// Any text growth, a visible stop control, or active thinking resets the quiet clock, so a
+// preamble cannot reach the terminal state: it is held until the reasoning phase ends and the
+// real answer streams (then proofA/proofB fire on the real answer). Tunable via env for live
+// calibration without a rebuild.
+export interface TerminalGateConfig {
+  barConfirmCycles: number;
+  quietMs: number;
+  minStableMs: number;
+  // Below this length, the quiet fallback (proofB) is NOT trusted: an implausibly short
+  // capture must be proven by the action bar (proofA), else it is refused (fail fast). This
+  // preserves the #293 guard against finalizing a 1-2 token mid-stream stub.
+  minAnswerLen: number;
+}
+
+const TERMINAL_GATE_CONFIG: TerminalGateConfig = {
+  barConfirmCycles: readPositiveIntEnv("ORACLE_BAR_CONFIRM_CYCLES", 3),
+  quietMs: readPositiveIntEnv("ORACLE_TERMINAL_QUIET_MS", 12_000),
+  minStableMs: readPositiveIntEnv("ORACLE_TERMINAL_MIN_STABLE_MS", 1_200),
+  minAnswerLen: MIN_CONFIDENT_ANSWER_LENGTH,
+};
+
+export interface TerminalGateState {
+  maxLen: number;
+  lastGrowthAt: number;
+  lastDisturbanceAt: number;
+  barStableCycles: number;
+}
+
+export interface TerminalSample {
+  now: number;
+  len: number;
   stopVisible: boolean;
-  completionVisible: boolean;
-}): boolean {
-  if (args.stopVisible || args.completionVisible) {
-    return true;
+  barVisible: boolean;
+  thinkingActive: boolean;
+}
+
+export function createTerminalGateState(now: number): TerminalGateState {
+  return { maxLen: 0, lastGrowthAt: now, lastDisturbanceAt: now, barStableCycles: 0 };
+}
+
+// Pure, unit-testable per-cycle classifier. Feed it one sample every poll; when it returns
+// terminal:true the capture is proven complete and safe to finalize.
+export function classifyTurnTerminal(
+  state: TerminalGateState,
+  sample: TerminalSample,
+  config: TerminalGateConfig,
+): { state: TerminalGateState; terminal: boolean } {
+  const grew = sample.len > state.maxLen;
+  const maxLen = grew ? sample.len : state.maxLen;
+  const lastGrowthAt = grew ? sample.now : state.lastGrowthAt;
+  const disturbed = grew || sample.stopVisible || sample.thinkingActive;
+  const lastDisturbanceAt = disturbed ? sample.now : state.lastDisturbanceAt;
+  const barStableCycles =
+    sample.barVisible && !sample.stopVisible && !sample.thinkingActive && !grew
+      ? state.barStableCycles + 1
+      : 0;
+  const next: TerminalGateState = { maxLen, lastGrowthAt, lastDisturbanceAt, barStableCycles };
+
+  let terminal = false;
+  if (!sample.stopVisible && sample.len > 0) {
+    const quietMs = sample.now - lastDisturbanceAt;
+    const stableMs = sample.now - lastGrowthAt;
+    // proofA — debounced action bar; bypasses the thinking veto (a present, debounced bar is
+    // stronger positive proof than any panel heuristic, and must not hang on a lingering panel).
+    const barProof = sample.barVisible && barStableCycles >= config.barConfirmCycles;
+    // proofB — generous quiet with no active thinking; the selector-drift-safe fallback.
+    // Withheld for implausibly short captures, which must be proven by the action bar.
+    const quietProof =
+      !sample.thinkingActive &&
+      sample.len >= config.minAnswerLen &&
+      stableMs >= config.minStableMs &&
+      quietMs >= config.quietMs;
+    terminal = barProof || quietProof;
   }
-  return isImplausiblyShortAnswer(args.candidateLength);
+  return { state: next, terminal };
 }
 const THINKING_STATUS_LABELS = [
   "thinking",
@@ -244,48 +321,32 @@ export async function waitForAssistantResponse(
     logger("Captured assistant generated image response");
     return candidate;
   }
-  // The evaluation path can race ahead of completion. If ChatGPT is still streaming, wait for the watchdog poller.
+  // The observer/refresh path can race ahead of true completion: a settled GPT-5.5 Pro
+  // preamble (or any mid-stream capture) looks done for a moment before the reasoning/tool
+  // phase begins. Re-confirm EVERY captured text through the terminal-only poller, which
+  // finalizes only on positive proof (a debounced action bar, or a quiet window with no
+  // active thinking). We deliberately drop the old ">= candidate length" acceptance: the
+  // poller is turn-scoped (minTurnIndex), so whatever it proves terminal is the right turn,
+  // even when the real answer is shorter than a verbose preamble.
   const elapsedMs = Date.now() - start;
   const remainingMs = Math.max(0, timeoutMs - elapsedMs);
-  const candidateText = String(candidate?.text ?? "").trim();
-  const suspiciouslyShort = isImplausiblyShortAnswer(candidateText.length);
   if (remainingMs > 0) {
-    const [stopVisible, completionVisible] = await Promise.all([
-      isStopButtonVisible(Runtime),
-      isCompletionVisible(Runtime),
-    ]);
-    // Completion controls can appear briefly while Pro is still replacing its thinking UI.
-    // Confirm every capture from that transition with the stability-based watchdog; a
-    // partial first paragraph can be arbitrarily long.
-    if (
-      shouldConfirmAssistantCompletion({
-        candidateLength: candidateText.length,
-        stopVisible,
-        completionVisible,
-      })
-    ) {
-      logger(
-        stopVisible
-          ? "Assistant still generating; waiting for completion"
-          : completionVisible
-            ? "Completion controls surfaced; confirming stable assistant response"
-            : "Captured an implausibly short response; confirming it is not a mid-stream capture",
-      );
-      const completed = await pollAssistantCompletion(
-        Runtime,
-        remainingMs,
-        minTurnIndex,
-        expectedConversationId,
-      );
-      if (completed && String(completed.text ?? "").trim().length >= candidateText.length) {
-        return completed;
-      }
+    logger("Confirming the capture is terminal (not a mid-stream/preamble capture)");
+    const completed = await pollAssistantCompletion(
+      Runtime,
+      remainingMs,
+      minTurnIndex,
+      expectedConversationId,
+    );
+    if (completed) {
+      return completed;
     }
-  }
-
-  if (suspiciouslyShort) {
+    // Could not prove completion within the budget: refuse rather than finalize a possibly
+    // incomplete capture. A clean, fast failure is recoverable (retry/salvage) and never
+    // ships a preamble as if it were the answer.
+    await logDomFailure(Runtime, logger, "assistant-response-unconfirmed");
     throw new Error(
-      "assistant-response short capture could not be confirmed before timeout; refusing to finalize it",
+      "assistant-response could not be confirmed complete before timeout; refusing to finalize a possibly-incomplete capture",
     );
   }
 
@@ -392,12 +453,26 @@ async function recoverAssistantResponse(
     400,
   );
   if (recovered) {
-    if (isImplausiblyShortAnswer(recovered.text.length)) {
-      logger("Recovered an implausibly short response; waiting for completion proof");
-      const remainingMs = Math.max(0, recoveryTimeoutMs - (Date.now() - recoveryStartedAt));
-      return pollAssistantCompletion(Runtime, remainingMs, minTurnIndex, expectedConversationId);
+    // Route EVERY recovered snapshot through the terminal-only poller (not just short ones):
+    // a recovered long preamble is exactly the raw-return bug this gate exists to prevent.
+    logger("Recovered a candidate response; confirming it is terminal before finalizing");
+    const remainingMs = Math.max(0, recoveryTimeoutMs - (Date.now() - recoveryStartedAt));
+    if (remainingMs > 0) {
+      const confirmed = await pollAssistantCompletion(
+        Runtime,
+        remainingMs,
+        minTurnIndex,
+        expectedConversationId,
+      );
+      if (confirmed) {
+        logger("Recovered and confirmed assistant response via polling fallback");
+        return confirmed;
+      }
+      // Unconfirmable within budget: refuse (return null) so the caller fails fast instead
+      // of finalizing a possibly-incomplete recovered capture.
+      await logConversationSnapshot(Runtime, logger).catch(() => undefined);
+      return null;
     }
-    logger("Recovered assistant response via polling fallback");
     return recovered;
   }
   await logConversationSnapshot(Runtime, logger).catch(() => undefined);
@@ -536,9 +611,7 @@ async function pollAssistantCompletion(
   meta: { turnId?: string | null; messageId?: string | null };
 } | null> {
   const watchdogDeadline = Date.now() + timeoutMs;
-  let previousLength = 0;
-  let stableCycles = 0;
-  let lastChangeAt = Date.now();
+  let gate = createTerminalGateState(Date.now());
   while (Date.now() < watchdogDeadline) {
     // Check abort signal to stop polling when another path won the race
     if (abortSignal?.aborted) {
@@ -547,43 +620,35 @@ async function pollAssistantCompletion(
     const snapshot = await readAssistantSnapshot(Runtime, minTurnIndex, expectedConversationId);
     const normalized = normalizeAssistantSnapshot(snapshot);
     if (normalized) {
-      const currentLength = normalized.text.length;
-      if (currentLength > previousLength) {
-        previousLength = currentLength;
-        stableCycles = 0;
-        lastChangeAt = Date.now();
-      } else {
-        stableCycles += 1;
-      }
-      const [stopVisible, completionVisible] = await Promise.all([
-        isStopButtonVisible(Runtime),
-        isCompletionVisible(Runtime),
-      ]);
+      // Generated-image answers stream no text and mount no action bar; accept immediately
+      // (kept BEFORE the terminal gate so they never wait out the quiet window).
       if (isGeneratedImageAssistantAnswer(normalized)) {
         return normalized;
       }
-      const shortAnswer = isImplausiblyShortAnswer(currentLength);
-      const mediumAnswer = currentLength >= MIN_CONFIDENT_ANSWER_LENGTH && currentLength < 40;
-      const longAnswer = currentLength >= 40 && currentLength < 500;
-      // Learned: short answers need a longer stability window or they truncate.
-      // Learned: long streaming responses (esp. thinking models) can pause mid-stream;
-      // use progressively longer windows to avoid truncation (#71).
-      const completionStableTarget = shortAnswer ? 12 : mediumAnswer ? 8 : longAnswer ? 6 : 8;
-      const requiredStableCycles = shortAnswer ? 12 : mediumAnswer ? 8 : longAnswer ? 8 : 10;
-      const stableMs = Date.now() - lastChangeAt;
-      const minStableMs = shortAnswer ? 8000 : mediumAnswer ? 1200 : longAnswer ? 2000 : 3000;
-      // Require stop button to disappear before treating completion as final.
-      if (!stopVisible) {
-        const stableEnough = stableCycles >= requiredStableCycles && stableMs >= minStableMs;
-        const completionEnough =
-          completionVisible && stableCycles >= completionStableTarget && stableMs >= minStableMs;
-        if (completionEnough || (!shortAnswer && stableEnough)) {
-          return normalized;
-        }
+      const [stopVisible, barVisible, thinkingActive] = await Promise.all([
+        isStopButtonVisible(Runtime),
+        isCompletionVisible(Runtime),
+        isThinkingActive(Runtime),
+      ]);
+      const decision = classifyTurnTerminal(
+        gate,
+        {
+          now: Date.now(),
+          len: normalized.text.length,
+          stopVisible,
+          barVisible,
+          thinkingActive,
+        },
+        TERMINAL_GATE_CONFIG,
+      );
+      gate = decision.state;
+      if (decision.terminal) {
+        return normalized;
       }
     } else {
-      previousLength = 0;
-      stableCycles = 0;
+      // The turn disappeared/reset (navigation, re-render): restart the gate so a stale
+      // quiet streak cannot carry over onto a fresh turn.
+      gate = createTerminalGateState(Date.now());
     }
     await delay(400);
   }
@@ -816,6 +881,7 @@ function buildResponseObserverExpression(
       return normalized.includes('answer now') && (normalized.includes('pro thinking') || normalized.includes('chatgpt said'));
     };
     ${buildActiveThinkingStatusPredicateJs("isActiveThinkingStatus")}
+    ${buildThinkingActivePredicateJs("isThinkingActiveNow")}
 
     // Helper to detect assistant turns - must match buildAssistantExtractor logic for consistency.
     const isAssistantTurn = (node) => {
@@ -982,8 +1048,15 @@ function buildResponseObserverExpression(
         }
         const stopVisible = Boolean(document.querySelector(STOP_SELECTOR));
         const finishedVisible = isLastAssistantTurnFinished();
+        // Defense in depth (the node side re-confirms every capture): never settle on a
+        // stable-but-quiet candidate while the model is actively thinking/generating, so the
+        // observer does not hand a settled preamble to the node path during the reasoning gap.
+        const thinkingActiveNow = isThinkingActiveNow();
 
-        if (finishedVisible || (!stopVisible && stableCycles >= stableTarget)) {
+        if (
+          finishedVisible ||
+          (!stopVisible && !thinkingActiveNow && stableCycles >= stableTarget)
+        ) {
           break;
         }
       }
