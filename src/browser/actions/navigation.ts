@@ -595,19 +595,41 @@ async function waitForPrompt(
   return false;
 }
 
-async function isCloudflareInterstitial(Runtime: ChromeClient["Runtime"]): Promise<boolean> {
-  const { result: titleResult } = await Runtime.evaluate({
-    expression: "document.title",
-    returnByValue: true,
-  });
-  const title = typeof titleResult.value === "string" ? titleResult.value : "";
-  const challengeTitle = CLOUDFLARE_TITLE.toLowerCase();
-  if (title.toLowerCase().includes(challengeTitle)) {
-    return true;
-  }
+// A single injected predicate. The old check flagged a challenge whenever the
+// '/challenge-platform/' script was present, but Cloudflare bot-management injects that script on
+// NORMAL ChatGPT pages too (including the new GPT-5.6 "Work" UI), so it false-flagged healthy pages
+// as challenges (which then aborted the run). Require a REAL interstitial: the "Just a moment"
+// title, a Cloudflare challenge widget / verification copy, or the script on a short interstitial
+// page. Crucially, if the ChatGPT app shell rendered, it is never a challenge.
+export function buildCloudflareInterstitialExpression(): string {
+  return `(() => {
+    const title = String(document.title || '').toLowerCase();
+    if (title.includes(${JSON.stringify(CLOUDFLARE_TITLE.toLowerCase())})) return true;
+    if (title.includes('attention required') && title.includes('cloudflare')) return true;
+    // App shell present => a real ChatGPT page, never the interstitial. This alone kills the
+    // false positive on pages that merely carry the Cloudflare bot-management script.
+    const hasAppShell = Boolean(document.querySelector(
+      '#prompt-textarea, [data-testid="prompt-textarea"], [data-testid^="conversation-turn"], [data-testid="profile-button"], main form[data-type], nav a[href*="/c/"]'
+    ));
+    if (hasAppShell) return false;
+    const bodyText = String((document.body && document.body.innerText) || '')
+      .toLowerCase().replace(/\\s+/g, ' ').trim();
+    const hasChallengeWidget = Boolean(document.querySelector(
+      '#challenge-form, #challenge-running, #cf-challenge-running, [class*="cf-challenge"], iframe[src*="challenges.cloudflare.com"], iframe[src*="/cdn-cgi/challenge-platform/"]'
+    ));
+    const saysVerifying = /verify(ing)? you are human|checking your browser|needs to review the security of your connection|just a moment/.test(bodyText);
+    const hasChallengeScript = Boolean(document.querySelector(${JSON.stringify(CLOUDFLARE_SCRIPT_SELECTOR)}));
+    // A genuine interstitial is a SHORT page; the content-rich app never is. So the script only
+    // counts on a short page with no app shell.
+    return hasChallengeWidget || saysVerifying || (hasChallengeScript && bodyText.length < 600);
+  })()`;
+}
 
+export const buildCloudflareInterstitialExpressionForTest = buildCloudflareInterstitialExpression;
+
+async function isCloudflareInterstitial(Runtime: ChromeClient["Runtime"]): Promise<boolean> {
   const { result } = await Runtime.evaluate({
-    expression: `Boolean(document.querySelector('${CLOUDFLARE_SCRIPT_SELECTOR}'))`,
+    expression: buildCloudflareInterstitialExpression(),
     returnByValue: true,
   });
   return Boolean(result.value);
