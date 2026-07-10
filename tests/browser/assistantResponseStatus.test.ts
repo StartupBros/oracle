@@ -354,9 +354,11 @@ describe("thinking-active completion veto", () => {
     getAttribute(name: string): string | null {
       return this.attrs[name] ?? null;
     }
-    querySelectorAll() {
+    querySelectorAll(selector: string) {
+      if (selector.includes("progress")) return this.children;
       return [];
     }
+    public children: FakeEl[] = [];
   }
 
   function evalThinkingActive(opts: {
@@ -367,6 +369,7 @@ describe("thinking-active completion veto", () => {
     progress?: boolean;
     progressNow?: number;
     progressMax?: number;
+    unrelatedProgress?: boolean;
     panel?: FakeEl;
   }): boolean {
     const predicate = buildThinkingActivePredicateJsForTest("isThinkingActive");
@@ -381,6 +384,11 @@ describe("thinking-active completion veto", () => {
         : { "aria-valuenow": "40", role: "progressbar" };
     const progressNodes =
       opts.progress || opts.progressNow != null ? [new FakeEl("", progressAttrs)] : [];
+    // Progress is scoped to the CURRENT assistant turn (review P1): the harness models the
+    // turn container; unrelatedProgress mounts a live bar OUTSIDE any turn, which must not veto.
+    const turn = new FakeEl("turn");
+    turn.children = progressNodes;
+    const turnNodes = [turn];
     const panelNodes = opts.panel ? [opts.panel] : [];
     const context = createContext({
       Array,
@@ -396,7 +404,12 @@ describe("thinking-active completion veto", () => {
           if (selector.includes("loading-shimmer")) return opts.shimmer ? [new FakeEl()] : [];
           if (selector.includes("aria-busy")) return opts.ariaBusy ? [new FakeEl()] : [];
           if (selector.includes("progressbar") || selector.includes("aria-valuenow")) {
-            return progressNodes;
+            // Only an UNRELATED page-wide bar is ever visible at document level now; the
+            // turn-scoped bars are reached through the turn node's own querySelectorAll.
+            return opts.unrelatedProgress ? [new FakeEl("", progressAttrs)] : [];
+          }
+          if (selector.includes("conversation-turn") || selector.includes("data-turn")) {
+            return turnNodes;
           }
           // The panel selector carries "aside"/"complementary"/"sidecar"; the status selector
           // does not, so match panels first to disambiguate (both mention thinking/reasoning).
@@ -456,13 +469,19 @@ describe("thinking-active completion veto", () => {
     },
   );
 
-  test("fires on a live progress bar as the sole liveness signal (progress-only sidecar)", () => {
+  test("fires on a live progress bar inside the current assistant turn", () => {
     expect(evalThinkingActive({ progress: true })).toBe(true);
   });
 
   test("does NOT fire on a completed progress bar (value at max)", () => {
     // A finished connector bar must not veto completion forever.
     expect(evalThinkingActive({ progressNow: 100, progressMax: 100 })).toBe(false);
+  });
+
+  test("does NOT fire on an unrelated progress bar outside the assistant turn", () => {
+    // Review P1: unrelated page UI can keep a visible progress bar mounted indefinitely; a
+    // document-wide veto would then hold a completed response until the watchdog timeout.
+    expect(evalThinkingActive({ unrelatedProgress: true })).toBe(false);
   });
 
   test("fires on a right-side reasoning sidecar panel with no inline label", () => {

@@ -574,7 +574,15 @@ export function buildThinkingActivePredicateJs(fnName: string): string {
         return true; // role=progressbar with no value -> indeterminate -> active
       });
     };
-    if (hasLiveProgress(document)) return true;
+    // Scoped to the CURRENT assistant turn, not the whole document: unrelated page UI can keep
+    // a visible progress bar mounted indefinitely (review P1), and a document-wide veto would
+    // then hold thinkingActive true until the watchdog timeout on a completed response. The
+    // sidecar check below covers verified reasoning panels; here only the latest turn counts.
+    const turns = (() => {
+      try { return document.querySelectorAll(CONVERSATION_SELECTOR); } catch { return []; }
+    })();
+    const lastTurn = turns.length ? turns[turns.length - 1] : null;
+    if (lastTurn instanceof HTMLElement && hasLiveProgress(lastTurn)) return true;
     // 6) A visible thinking/reasoning sidecar panel (the connector/reasoning phase is often
     //    exposed ONLY through a right-side panel with no inline label). Match the existing
     //    thinking-monitor heuristic: a right-side panel that looks like thinking, or any such
