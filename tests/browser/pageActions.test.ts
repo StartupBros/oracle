@@ -14,6 +14,7 @@ import {
 import { createContext, Script } from "node:vm";
 import {
   buildCloudflareInterstitialExpressionForTest,
+  isCloudflareInterstitialForTest,
   buildLoginProbeExpressionForTest,
   buildWelcomeBackAccountPickerExpressionForTest,
 } from "../../src/browser/actions/navigation.js";
@@ -256,11 +257,44 @@ describe("waitForResumedConversationHydration", () => {
   });
 });
 
+describe("isCloudflareInterstitial hydration grace", () => {
+  const verdicts = (...values: unknown[]) => {
+    const fn = vi.fn();
+    for (const value of values) fn.mockResolvedValueOnce({ result: { value } });
+    fn.mockResolvedValue({ result: { value: values[values.length - 1] } });
+    return { evaluate: fn } as unknown as ChromeClient["Runtime"];
+  };
+
+  test("weak-only evidence that resolves into the app shell is NOT a challenge", async () => {
+    // The post-navigation race: bot-management script present, React shell not yet hydrated,
+    // short body. The shell appearing during the grace window must clear the classification.
+    const runtime = verdicts({ weak: true }, { weak: true }, { shell: true });
+    await expect(isCloudflareInterstitialForTest(runtime, 5_000)).resolves.toBe(false);
+  });
+
+  test("weak-only evidence that persists through the grace window IS a challenge", async () => {
+    const runtime = verdicts({ weak: true });
+    await expect(isCloudflareInterstitialForTest(runtime, 1_200)).resolves.toBe(true);
+  });
+
+  test("strong evidence classifies immediately without waiting", async () => {
+    const runtime = verdicts({ strong: true });
+    const started = Date.now();
+    await expect(isCloudflareInterstitialForTest(runtime, 60_000)).resolves.toBe(true);
+    expect(Date.now() - started).toBeLessThan(2_000);
+  });
+
+  test("no evidence at all returns false immediately", async () => {
+    const runtime = verdicts({});
+    await expect(isCloudflareInterstitialForTest(runtime, 60_000)).resolves.toBe(false);
+  });
+});
+
 describe("ensureNotBlocked", () => {
   test("throws descriptive error when cloudflare detected", async () => {
-    // The detector is now a single boolean-returning injected predicate.
+    // The detector evaluates a verdict object; strong evidence classifies immediately.
     const runtime = {
-      evaluate: vi.fn().mockResolvedValue({ result: { value: true } }),
+      evaluate: vi.fn().mockResolvedValue({ result: { value: { strong: true } } }),
     } as unknown as ChromeClient["Runtime"];
     await expect(ensureNotBlocked(runtime, true, logger)).rejects.toThrow(/headless mode/i);
     expect(logger).toHaveBeenCalledWith("Cloudflare anti-bot page detected");
@@ -268,14 +302,17 @@ describe("ensureNotBlocked", () => {
 
   test("passes through when not a challenge (e.g. a normal page carrying the CF script)", async () => {
     const runtime = {
-      evaluate: vi.fn().mockResolvedValue({ result: { value: false } }),
+      evaluate: vi
+        .fn()
+        .mockResolvedValueOnce({ result: { value: { shell: true } } }) // challenge verdict: app shell
+        .mockResolvedValue({ result: { value: false } }), // account security block probe
     } as unknown as ChromeClient["Runtime"];
     await expect(ensureNotBlocked(runtime, false, logger)).resolves.toBeUndefined();
   });
 
   test("throws structured browser error when headful cloudflare is detected", async () => {
     const runtime = {
-      evaluate: vi.fn().mockResolvedValue({ result: { value: true } }),
+      evaluate: vi.fn().mockResolvedValue({ result: { value: { strong: true } } }),
     } as unknown as ChromeClient["Runtime"];
     try {
       await ensureNotBlocked(runtime, false, logger);
@@ -293,7 +330,7 @@ describe("ensureNotBlocked", () => {
     const runtime = {
       evaluate: vi
         .fn()
-        .mockResolvedValueOnce({ result: { value: false } }) // not a Cloudflare interstitial
+        .mockResolvedValueOnce({ result: { value: { shell: true } } }) // not a Cloudflare interstitial
         .mockResolvedValueOnce({ result: { value: true } }), // account security block
     } as unknown as ChromeClient["Runtime"];
 
