@@ -241,6 +241,8 @@ describe("completion action correlation", () => {
   test("fallback snapshots carry only node-scoped completion evidence", () => {
     const expression = buildMarkdownFallbackExtractorForTest("1");
     expect(expression).toContain("completionVisible: actionMarkdowns.includes(node)");
+    expect(expression).toContain("return Boolean(lastUser.compareDocumentPosition(node) & 4)");
+    expect(expression).toContain("if (!hasTurns) return isAfterCurrentUser(node)");
   });
 });
 

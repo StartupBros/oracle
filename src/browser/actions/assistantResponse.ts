@@ -1285,20 +1285,26 @@ function buildMarkdownFallbackExtractor(minTurnLiteral?: string): string {
       const idx = turnNodes.findIndex((turn) => turn === node || turn.contains?.(node));
       return idx >= 0 ? idx : null;
     };
+    const normalize = (value) => String(value || '').toLowerCase().replace(/\\s+/g, ' ').trim();
+    const collectLastUser = (scope) => {
+      if (!scope?.querySelectorAll) return null;
+      const userTurns = Array.from(scope.querySelectorAll('[data-message-author-role="user"], [data-turn="user"]'));
+      return userTurns[userTurns.length - 1] ?? null;
+    };
+    const lastUser = collectLastUser(root) || collectLastUser(document);
+    const userText = lastUser ? normalize(lastUser.innerText || lastUser.textContent || '') : '';
+    const isAfterCurrentUser = (node) => {
+      if (!lastUser || typeof lastUser.compareDocumentPosition !== 'function') return false;
+      // Node.DOCUMENT_POSITION_FOLLOWING = 4. Use the numeric bit so the injected expression
+      // also works in stripped browser test contexts without a global Node constructor.
+      return Boolean(lastUser.compareDocumentPosition(node) & 4);
+    };
     const isAfterMinTurn = (node) => {
       if (__minTurn === null) return true;
-      if (!hasTurns) return true;
+      if (!hasTurns) return isAfterCurrentUser(node);
       const idx = resolveTurnIndex(node);
       return idx !== null && idx >= __minTurn;
     };
-    const normalize = (value) => String(value || '').toLowerCase().replace(/\\s+/g, ' ').trim();
-    const collectUserText = (scope) => {
-      if (!scope?.querySelectorAll) return '';
-      const userTurns = Array.from(scope.querySelectorAll('[data-message-author-role="user"], [data-turn="user"]'));
-      const lastUser = userTurns[userTurns.length - 1];
-      return lastUser ? normalize(lastUser.innerText || lastUser.textContent || '') : '';
-    };
-    const userText = collectUserText(root) || collectUserText(document);
     const isUserEcho = (text) => {
       if (!userText) return false;
       const normalized = normalize(text);
