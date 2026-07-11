@@ -181,8 +181,10 @@ function parseDebugPort(raw?: string | null): number | null {
 
 function parseMaxConcurrentTabs(raw?: string | null): number | null {
   if (!raw) return null;
-  const value = Number.parseInt(raw, 10);
-  if (!Number.isFinite(value) || value <= 0) {
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return null;
+  const value = Number(trimmed);
+  if (!Number.isInteger(value) || value <= 0) {
     return null;
   }
   return value;

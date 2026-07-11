@@ -119,6 +119,11 @@ describe("resolveBrowserConfig", () => {
 
     process.env.ORACLE_BROWSER_MAX_CONCURRENT_TABS = "not-a-number";
     expect(resolveBrowserConfig(undefined).maxConcurrentTabs).toBe(3);
+
+    for (const malformed of ["5junk", "2.5", "1e2"]) {
+      process.env.ORACLE_BROWSER_MAX_CONCURRENT_TABS = malformed;
+      expect(resolveBrowserConfig(undefined).maxConcurrentTabs).toBe(3);
+    }
   });
 
   test("uses the longer Deep Research timeout unless explicitly overridden", () => {
