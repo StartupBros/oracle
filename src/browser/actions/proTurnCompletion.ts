@@ -71,9 +71,26 @@ type KeyedMessage = {
  *       -> recipient=all text(finish_details.type=stop)
  *
  * We therefore require that topology and reject any candidate followed by (or
- * graph-incomparable with) an `is_reasoning` thoughts/code node from the same
- * turn. Failing closed is intentional: an unverifiable response must not be
- * returned or persisted as though it were the final answer.
+ * graph-incomparable with) an `is_reasoning` node from the same turn. Failing
+ * closed is intentional: an unverifiable response must not be returned or
+ * persisted as though it were the final answer.
+ *
+ * CALLER CONTRACT — `done: false` means "not proven", never "not finished".
+ *
+ *   1. A `done: false` result MUST NOT, on its own, start a fresh turn. This
+ *      verifier has known false negatives (a regenerated turn produces two
+ *      complete branches and no `current_node` is read, so both are rejected —
+ *      see the "KNOWN LIMITATION" test). Retrying on one would spend a second
+ *      Pro consultation on an answer that already exists. Fall through to the
+ *      existing DOM signal and the normal recovery path instead; that costs
+ *      nothing beyond today's behaviour.
+ *   2. Gate dispatch. A turn with no reasoning phase never satisfies this
+ *      contract, so routing a non-reasoning model here polls until the caller's
+ *      own timeout. Only call this for turns known to be Pro/reasoning turns.
+ *   3. Treat a sustained "no recap and no active reasoning" state as
+ *      inconclusive rather than terminal, and debounce over several polls
+ *      before trusting it — the single-snapshot form cannot distinguish
+ *      "the recap has not arrived yet" from "no recap is coming".
  */
 export function evaluateProTurnCompletion(
   mapping: ConversationMapping,
@@ -133,10 +150,17 @@ export function evaluateProTurnCompletion(
     };
   }
 
+  // DEVIATION from rosetta 12ed925a: the original additionally required
+  // content_type to be "thoughts" or "code" here. That allowlist is a fail-open
+  // hole — a resumed-reasoning node carrying any other content_type is invisible
+  // to the veto, so an interim text gets returned as the final answer, which is
+  // precisely the premature-capture bug this verifier exists to prevent. See the
+  // regression test "resumed reasoning vetoes a candidate regardless of its
+  // content_type". `reasoning_status` is the field that actually means "still
+  // reasoning"; content_type only names the node kind, so key on the former
+  // alone. This is strictly more conservative: it vetoes a superset.
   const activeReasoning = turnMessages.filter(
-    ({ message }) =>
-      (message.content?.content_type === "thoughts" || message.content?.content_type === "code") &&
-      message.metadata?.reasoning_status === "is_reasoning",
+    ({ message }) => message.metadata?.reasoning_status === "is_reasoning",
   );
 
   const structurallySafe = afterReasoningEnded.filter((candidate) =>
