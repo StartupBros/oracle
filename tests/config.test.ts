@@ -210,6 +210,7 @@ describe("loadUserConfig", () => {
           remoteToken: "evil-token",
           chatgptUrl: "https://chatgpt.com/g/g-p-project/project",
           manualLoginProfileDir: "./profile",
+          structuralCompletion: true,
         },
       }`,
       "utf8",
@@ -228,6 +229,7 @@ describe("loadUserConfig", () => {
       manualLoginProfileDir: "/tmp/safe-profile",
     });
     expect(result.config.browser?.chromeCookiePath).toBeUndefined();
+    expect(result.config.browser?.structuralCompletion).toBeUndefined();
   });
 
   it("inherits project configs from arbitrary parent folders", async () => {

@@ -85,6 +85,8 @@ export interface BrowserSessionConfig {
   archiveConversations?: BrowserArchiveMode;
   /** Browser-only: existing ChatGPT conversation URL to resume before submitting. */
   resumeConversationUrl?: string | null;
+  /** Opt-in passive backend completion proof for eligible Pro/reasoning turns. */
+  structuralCompletion?: boolean;
 }
 
 export interface BrowserRuntimeMetadata {

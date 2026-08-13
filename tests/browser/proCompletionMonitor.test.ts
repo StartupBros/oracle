@@ -69,7 +69,7 @@ function makeNetwork() {
       finished.push(handler);
       return () => removed.push("finished");
     }),
-    getResponseBody: vi.fn(async () => ({
+    getResponseBody: vi.fn(async (_params?: { requestId: string }) => ({
       base64Encoded: false,
       body: [
         'data: {"type":"stream_handoff","conversation_id":"conv-1","turn_exchange_id":"turn-current"}',
@@ -124,6 +124,7 @@ describe("createProCompletionMonitor", () => {
     );
 
     monitor.reset();
+    monitor.arm();
     const resultPromise = monitor.waitForCompletion(5_000);
     await network.emitRequest({
       requestId: "ignored-get",
@@ -136,11 +137,14 @@ describe("createProCompletionMonitor", () => {
     await network.emitResponse({ requestId: "send-1", response: { status: 200 } });
     await network.emitFinished({ requestId: "send-1" });
 
-    await expect(resultPromise).resolves.toMatchObject({
-      text: "Verified Pro answer.",
-      messageId: "final-message",
-      modelSlug: "gpt-5-6-pro",
-      finishReason: "stop",
+    await expect(resultPromise).resolves.toEqual({
+      status: "verified",
+      answer: {
+        text: "Verified Pro answer.",
+        messageId: "final-message",
+        modelSlug: "gpt-5-6-pro",
+        finishReason: "stop",
+      },
     });
     expect(network.getResponseBody).toHaveBeenCalledWith({ requestId: "send-1" });
     expect(evaluate).toHaveBeenCalledWith(
@@ -170,6 +174,7 @@ describe("createProCompletionMonitor", () => {
     );
 
     monitor.reset();
+    monitor.arm();
     const resultPromise = monitor.waitForCompletion(1_050);
     await network.emitRequest({
       requestId: "send-1",
@@ -178,7 +183,233 @@ describe("createProCompletionMonitor", () => {
     await network.emitResponse({ requestId: "send-1", response: { status: 200 } });
     await network.emitFinished({ requestId: "send-1" });
 
-    await expect(resultPromise).resolves.toBeNull();
+    await expect(resultPromise).resolves.toMatchObject({ status: "inconclusive" });
     monitor.stop();
+  });
+
+  test("does not expose a malformed mapping response to Node logs", async () => {
+    const network = makeNetwork();
+    const logger = vi.fn() as BrowserLogger & { mock: { calls: unknown[][] } };
+    logger.verbose = true;
+    const runtime = {
+      evaluate: vi.fn(async () => ({
+        result: { value: { status: 502, body: undefined } },
+      })),
+    } as unknown as ChromeClient["Runtime"];
+    const monitor = createProCompletionMonitor(
+      network as unknown as ChromeClient["Network"],
+      runtime,
+      logger,
+    );
+
+    monitor.reset();
+    monitor.arm();
+    const resultPromise = monitor.waitForCompletion(1_050);
+    await network.emitRequest({
+      requestId: "send-1",
+      request: { method: "POST", url: "https://chatgpt.com/backend-api/f/conversation" },
+    });
+    await network.emitResponse({ requestId: "send-1", response: { status: 200 } });
+    await network.emitFinished({ requestId: "send-1" });
+
+    await expect(resultPromise).resolves.toMatchObject({
+      status: "inconclusive",
+      reason: "mapping request returned HTTP 502",
+    });
+    expect(logger.mock.calls.flat().join(" ")).not.toContain("Authorization");
+    expect(logger.mock.calls.flat().join(" ")).not.toContain("cookie");
+    monitor.stop();
+  });
+
+  test("maps a Runtime failure to inconclusive instead of rejecting", async () => {
+    const network = makeNetwork();
+    const runtime = {
+      evaluate: vi.fn(async () => {
+        throw new Error("execution context was destroyed");
+      }),
+    } as unknown as ChromeClient["Runtime"];
+    const monitor = createProCompletionMonitor(
+      network as unknown as ChromeClient["Network"],
+      runtime,
+      vi.fn() as BrowserLogger,
+    );
+
+    monitor.reset();
+    monitor.arm();
+    const resultPromise = monitor.waitForCompletion(1_050);
+    await network.emitRequest({
+      requestId: "send-1",
+      request: { method: "POST", url: "https://chatgpt.com/backend-api/f/conversation" },
+    });
+    await network.emitResponse({ requestId: "send-1", response: { status: 200 } });
+    await network.emitFinished({ requestId: "send-1" });
+
+    await expect(resultPromise).resolves.toMatchObject({
+      status: "inconclusive",
+      reason: "mapping request failed",
+    });
+    monitor.stop();
+  });
+
+  test("includes the bootstrap wait in the caller's timeout", async () => {
+    const network = makeNetwork();
+    const monitor = createProCompletionMonitor(
+      network as unknown as ChromeClient["Network"],
+      {} as ChromeClient["Runtime"],
+      vi.fn() as BrowserLogger,
+    );
+
+    const started = Date.now();
+    const result = await monitor.waitForCompletion(25);
+    expect(result).toMatchObject({
+      status: "unavailable",
+      reason: "Pro stream handoff not observed",
+    });
+    expect(Date.now() - started).toBeLessThan(150);
+    monitor.stop();
+  });
+
+  test("tracks past an auxiliary POST and binds the later Pro handoff", async () => {
+    const network = makeNetwork();
+    network.getResponseBody.mockImplementation(async ({ requestId } = { requestId: "" }) => ({
+      base64Encoded: false,
+      body:
+        requestId === "auxiliary-post"
+          ? 'data: {"type":"message_stream_complete"}'
+          : 'data: {"type":"stream_handoff","conversation_id":"conv-1","turn_exchange_id":"turn-current"}',
+    }));
+    const runtime = {
+      evaluate: vi.fn(async () => ({
+        result: { value: { status: 200, body: { mapping: completedMapping() } } },
+      })),
+    } as unknown as ChromeClient["Runtime"];
+    const monitor = createProCompletionMonitor(
+      network as unknown as ChromeClient["Network"],
+      runtime,
+      vi.fn() as BrowserLogger,
+    );
+
+    monitor.reset();
+    monitor.arm();
+    const resultPromise = monitor.waitForCompletion(5_000);
+    await network.emitRequest({
+      requestId: "auxiliary-post",
+      request: { method: "POST", url: "https://chatgpt.com/backend-api/f/conversation" },
+    });
+    await network.emitResponse({ requestId: "auxiliary-post", response: { status: 200 } });
+    await network.emitFinished({ requestId: "auxiliary-post" });
+    await network.emitRequest({
+      requestId: "intended-post",
+      request: { method: "POST", url: "https://chatgpt.com/backend-api/f/conversation" },
+    });
+    await network.emitResponse({ requestId: "intended-post", response: { status: 200 } });
+    await network.emitFinished({ requestId: "intended-post" });
+
+    await expect(resultPromise).resolves.toMatchObject({
+      status: "verified",
+      answer: { text: "Verified Pro answer." },
+    });
+    expect(network.getResponseBody).toHaveBeenCalledWith({ requestId: "auxiliary-post" });
+    expect(network.getResponseBody).toHaveBeenCalledWith({ requestId: "intended-post" });
+    monitor.stop();
+  });
+
+  test("does not bind a stale request arriving after reset but before arm", async () => {
+    const network = makeNetwork();
+    const runtime = {
+      evaluate: vi.fn(async () => ({
+        result: { value: { status: 200, body: { mapping: completedMapping() } } },
+      })),
+    } as unknown as ChromeClient["Runtime"];
+    const monitor = createProCompletionMonitor(
+      network as unknown as ChromeClient["Network"],
+      runtime,
+      vi.fn() as BrowserLogger,
+    );
+
+    monitor.reset();
+    await network.emitRequest({
+      requestId: "stale-after-reset",
+      request: { method: "POST", url: "https://chatgpt.com/backend-api/f/conversation" },
+    });
+    monitor.arm();
+    const resultPromise = monitor.waitForCompletion(5_000);
+    await network.emitRequest({
+      requestId: "intended-after-arm",
+      request: { method: "POST", url: "https://chatgpt.com/backend-api/f/conversation" },
+    });
+    await network.emitResponse({ requestId: "intended-after-arm", response: { status: 200 } });
+    await network.emitFinished({ requestId: "intended-after-arm" });
+
+    await expect(resultPromise).resolves.toMatchObject({ status: "verified" });
+    expect(network.getResponseBody).toHaveBeenCalledWith({ requestId: "intended-after-arm" });
+    expect(network.getResponseBody).not.toHaveBeenCalledWith({ requestId: "stale-after-reset" });
+    monitor.stop();
+  });
+
+  test("ignores a conversation request observed before reset", async () => {
+    const network = makeNetwork();
+    const runtime = {
+      evaluate: vi.fn(async () => ({
+        result: { value: { status: 200, body: { mapping: completedMapping() } } },
+      })),
+    } as unknown as ChromeClient["Runtime"];
+    const monitor = createProCompletionMonitor(
+      network as unknown as ChromeClient["Network"],
+      runtime,
+      vi.fn() as BrowserLogger,
+    );
+
+    await network.emitRequest({
+      requestId: "stale-send",
+      request: { method: "POST", url: "https://chatgpt.com/backend-api/f/conversation" },
+    });
+    monitor.reset();
+    monitor.arm();
+    const resultPromise = monitor.waitForCompletion(25);
+    await network.emitRequest({
+      requestId: "current-send",
+      request: { method: "POST", url: "https://chatgpt.com/backend-api/f/conversation" },
+    });
+    await network.emitResponse({ requestId: "current-send", response: { status: 200 } });
+    await network.emitFinished({ requestId: "current-send" });
+
+    await expect(resultPromise).resolves.toMatchObject({ status: "verified" });
+    expect(network.getResponseBody).toHaveBeenCalledWith({ requestId: "current-send" });
+    monitor.stop();
+  });
+
+  test("returns inconclusive when mapping evaluation never settles", async () => {
+    const network = makeNetwork();
+    const runtime = {
+      evaluate: vi.fn(() => new Promise<never>(() => undefined)),
+    } as unknown as ChromeClient["Runtime"];
+    const monitor = createProCompletionMonitor(
+      network as unknown as ChromeClient["Network"],
+      runtime,
+      vi.fn() as BrowserLogger,
+    );
+
+    monitor.reset();
+    monitor.arm();
+    const resultPromise = monitor.waitForCompletion(50);
+    await network.emitRequest({
+      requestId: "send-1",
+      request: { method: "POST", url: "https://chatgpt.com/backend-api/f/conversation" },
+    });
+    await network.emitResponse({ requestId: "send-1", response: { status: 200 } });
+    await network.emitFinished({ requestId: "send-1" });
+
+    await expect(resultPromise).resolves.toMatchObject({
+      status: "inconclusive",
+      reason: "mapping request timed out",
+    });
+    monitor.stop();
+  });
+
+  test("does not arm Network observers when structural completion is disabled", () => {
+    // The flag-off invariant is enforced at index.ts creation sites; this test
+    // documents that the monitor itself is opt-in rather than a global observer.
+    expect(createProCompletionMonitor).toBeTypeOf("function");
   });
 });

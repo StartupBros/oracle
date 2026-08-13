@@ -242,8 +242,79 @@ describe("promptComposer", () => {
     expect(promptComposer.sendButtonTimeoutMs(["oracle-attach-verify.txt"], 120_000)).toBe(120_000);
   });
 
+  test("runs onPromptSend before onPromptSubmitted at the trusted click boundary", async () => {
+    const events: string[] = [];
+    const onPromptSend = vi.fn((): void => {
+      events.push("send");
+    });
+    const onPromptSubmitted = vi.fn((): void => {
+      events.push("submitted");
+    });
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("document.readyState")) {
+          return { result: { value: { ready: true, composer: true, fileInput: false } } };
+        }
+        if (expression.includes("focused: true")) {
+          return { result: { value: { focused: true } } };
+        }
+        if (expression.includes("editorText")) {
+          return {
+            result: { value: { editorText: "hello", fallbackValue: "", activeValue: "hello" } },
+          };
+        }
+        if (expression.includes("button.scrollIntoView")) {
+          events.push("button-ready");
+          return { result: { value: { status: "point", x: 10, y: 20 } } };
+        }
+        return {
+          result: {
+            value: {
+              baseline: 0,
+              turnsCount: 1,
+              userMatched: true,
+              prefixMatched: false,
+              lastMatched: true,
+              hasNewTurn: true,
+              stopVisible: true,
+              assistantVisible: false,
+              composerCleared: true,
+              inConversation: true,
+            },
+          },
+        };
+      }),
+    };
+    const input = {
+      insertText: vi.fn(),
+      dispatchMouseEvent: vi.fn(async ({ type }: { type: string }) => {
+        if (type === "mouseReleased") events.push("mouse-release");
+      }),
+      dispatchKeyEvent: vi.fn(),
+    };
+    const logger = Object.assign(vi.fn(), { verbose: false });
+
+    await submitPrompt(
+      {
+        runtime: runtime as never,
+        input: input as never,
+        baselineTurns: 0,
+        onPromptSend,
+        onPromptSubmitted,
+      },
+      "hello",
+      logger as never,
+    );
+
+    expect(onPromptSend).toHaveBeenCalledTimes(1);
+    expect(onPromptSubmitted).toHaveBeenCalledTimes(1);
+    expect(events.indexOf("send")).toBeLessThan(events.indexOf("mouse-release"));
+    expect(events.indexOf("mouse-release")).toBeLessThan(events.indexOf("submitted"));
+  });
+
   test("marks prompt submitted before commit verification finishes", async () => {
     const onPromptSubmitted = vi.fn();
+
     const runtime = {
       evaluate: vi.fn(async ({ expression }: { expression: string }) => {
         if (expression.includes("document.readyState")) {

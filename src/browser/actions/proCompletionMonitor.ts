@@ -10,6 +10,9 @@ const DEFAULT_BOOTSTRAP_TIMEOUT_MS = 30_000;
 const DEFAULT_POLL_INTERVAL_MS = 2_000;
 const MIN_POLL_INTERVAL_MS = 1_000;
 const MAX_POLL_INTERVAL_MS = 10_000;
+const DEFAULT_MAPPING_REQUEST_TIMEOUT_MS = 10_000;
+const MAX_CANDIDATE_REQUESTS = 8;
+const MAX_CANDIDATE_AGE_MS = 30_000;
 
 type NetworkRequestEvent = {
   requestId: string;
@@ -35,9 +38,15 @@ export interface ProStructuralAnswer {
   finishReason?: string;
 }
 
+export type ProCompletionObservation =
+  | { status: "verified"; answer: ProStructuralAnswer }
+  | { status: "unavailable"; reason: string }
+  | { status: "inconclusive"; reason: string };
+
 export interface ProCompletionMonitor {
   reset(): void;
-  waitForCompletion(timeoutMs: number): Promise<ProStructuralAnswer | null>;
+  arm(): void;
+  waitForCompletion(timeoutMs: number): Promise<ProCompletionObservation>;
   stop(): void;
 }
 
@@ -45,6 +54,19 @@ interface Deferred<T> {
   promise: Promise<T>;
   resolve(value: T): void;
 }
+
+interface CandidateRequest {
+  generation: number;
+  responseStatus?: number;
+  bodyRead: boolean;
+  createdAt: number;
+}
+
+type MappingResponse = {
+  status: number;
+  body?: { mapping?: ConversationMapping };
+  timedOut?: boolean;
+};
 
 function deferred<T>(): Deferred<T> {
   let resolve!: (value: T) => void;
@@ -67,63 +89,117 @@ export function createProCompletionMonitor(
 ): ProCompletionMonitor {
   let generation = 0;
   let stopped = false;
-  let requestId: string | undefined;
-  let responseStatus: number | undefined;
+  let armed = false;
   let handoff: StreamHandoff | null = null;
   let handoffSignal = deferred<StreamHandoff | null>();
+  const candidates = new Map<string, CandidateRequest>();
 
   const reset = (): void => {
+    if (stopped) return;
     generation += 1;
-    requestId = undefined;
-    responseStatus = undefined;
+    armed = false;
     handoff = null;
+    candidates.clear();
+    handoffSignal.resolve(null);
+    handoffSignal = deferred<StreamHandoff | null>();
+  };
+
+  const arm = (): void => {
+    if (stopped) return;
+    generation += 1;
+    armed = true;
+    handoff = null;
+    candidates.clear();
     handoffSignal.resolve(null);
     handoffSignal = deferred<StreamHandoff | null>();
   };
 
   const onRequest = (event: NetworkRequestEvent): void => {
-    if (stopped || requestId || !isConversationSubmissionUrl(event.request?.url)) return;
+    if (stopped || !armed || handoff || candidates.has(event.requestId)) return;
+    if (!isConversationSubmissionUrl(event.request?.url)) return;
+    const now = Date.now();
+    for (const [candidateId, candidate] of candidates) {
+      if (now - candidate.createdAt >= MAX_CANDIDATE_AGE_MS) {
+        candidates.delete(candidateId);
+      }
+    }
     if (event.request?.method && event.request.method.toUpperCase() !== "POST") return;
-    requestId = event.requestId;
-    if (logger.verbose)
-      logger(`[browser] structural monitor bound conversation request ${requestId}`);
+
+    while (candidates.size >= MAX_CANDIDATE_REQUESTS) {
+      const oldest = candidates.keys().next().value as string | undefined;
+      if (!oldest) break;
+      candidates.delete(oldest);
+    }
+    candidates.set(event.requestId, {
+      generation,
+      bodyRead: false,
+      createdAt: Date.now(),
+    });
+    if (logger.verbose) {
+      logger(`[browser] structural monitor tracking conversation request ${event.requestId}`);
+    }
   };
 
   const onResponse = (event: NetworkResponseEvent): void => {
-    if (stopped || event.requestId !== requestId) return;
-    responseStatus = event.response?.status;
+    const candidate = candidates.get(event.requestId);
+    if (stopped || !candidate || candidate.generation !== generation) return;
+    candidate.responseStatus = event.response?.status;
     if (logger.verbose) {
       logger(
-        `[browser] structural monitor received conversation response ${String(responseStatus ?? "unknown")}`,
+        `[browser] structural monitor received conversation response ${String(candidate.responseStatus ?? "unknown")}`,
       );
     }
   };
 
   const onLoadingFinished = async (event: NetworkLoadingFinishedEvent): Promise<void> => {
-    if (stopped || event.requestId !== requestId || handoff) return;
+    const candidate = candidates.get(event.requestId);
+    if (
+      stopped ||
+      !armed ||
+      handoff ||
+      !candidate ||
+      candidate.generation !== generation ||
+      candidate.bodyRead
+    ) {
+      return;
+    }
+    candidate.bodyRead = true;
     const eventGeneration = generation;
     try {
-      if (responseStatus !== undefined && (responseStatus < 200 || responseStatus >= 300)) {
-        handoffSignal.resolve(null);
+      if (
+        candidate.responseStatus !== undefined &&
+        (candidate.responseStatus < 200 || candidate.responseStatus >= 300)
+      ) {
+        candidates.delete(event.requestId);
         return;
       }
       const body = await Network.getResponseBody({ requestId: event.requestId });
-      if (stopped || eventGeneration !== generation) return;
+      if (
+        stopped ||
+        !armed ||
+        eventGeneration !== generation ||
+        candidates.get(event.requestId) !== candidate
+      ) {
+        return;
+      }
       const text = body.base64Encoded
         ? Buffer.from(body.body, "base64").toString("utf8")
         : body.body;
-      handoff = extractStreamHandoff(text);
-      if (!handoff) {
-        if (logger.verbose) logger("[browser] structural monitor found no Pro stream handoff");
-      }
-      handoffSignal.resolve(handoff);
-    } catch (error) {
-      if (logger.verbose) {
+      const nextHandoff = extractStreamHandoff(text);
+      candidates.delete(event.requestId);
+      if (nextHandoff) {
+        handoff = nextHandoff;
+        handoffSignal.resolve(nextHandoff);
+      } else if (logger.verbose) {
         logger(
-          `[browser] structural monitor could not read conversation response: ${error instanceof Error ? error.message : String(error)}`,
+          "[browser] structural monitor ignored conversation response without Pro stream handoff",
         );
       }
-      handoffSignal.resolve(null);
+    } catch {
+      candidates.delete(event.requestId);
+      if (logger.verbose) {
+        logger("[browser] structural monitor could not read conversation response");
+      }
     }
   };
 
@@ -133,27 +209,58 @@ export function createProCompletionMonitor(
     Network.loadingFinished(onLoadingFinished) as unknown as () => void,
   ];
 
-  const waitForCompletion = async (timeoutMs: number): Promise<ProStructuralAnswer | null> => {
+  const waitForCompletion = async (timeoutMs: number): Promise<ProCompletionObservation> => {
     const eventGeneration = generation;
+    const deadline = Date.now() + Math.max(timeoutMs, 0);
     const bootstrap = await waitWithTimeout(
       handoffSignal.promise,
-      Math.min(Math.max(timeoutMs, 0), DEFAULT_BOOTSTRAP_TIMEOUT_MS),
+      Math.min(DEFAULT_BOOTSTRAP_TIMEOUT_MS, Math.max(0, deadline - Date.now())),
     );
-    if (!bootstrap || stopped || eventGeneration !== generation) return null;
+    if (stopped || eventGeneration !== generation) {
+      return { status: "unavailable", reason: "monitor stopped or reset" };
+    }
+    if (!bootstrap) {
+      armed = false;
+      return { status: "unavailable", reason: "Pro stream handoff not observed" };
+    }
 
     let pollIntervalMs = DEFAULT_POLL_INTERVAL_MS;
-    const deadline = Date.now() + Math.max(timeoutMs, 0);
     let lastReason = "mapping not fetched";
     while (!stopped && eventGeneration === generation && Date.now() < deadline) {
-      const mappingResponse = await fetchConversationMapping(Runtime, bootstrap.conversationId);
-      if (stopped || eventGeneration !== generation) return null;
-      if (mappingResponse?.status === 200) {
-        const mapping = mappingResponse.body?.mapping ?? {};
-        pollIntervalMs = readPollInterval(mapping, bootstrap.turnExchangeId, pollIntervalMs);
-        const verification = evaluateProTurnCompletion(mapping, bootstrap.turnExchangeId);
-        lastReason = verification.reason ?? "verified";
-        if (verification.done && verification.finalText && verification.finalMessageId) {
-          return toStructuralAnswer(verification);
+      const remainingMs = Math.max(0, deadline - Date.now());
+      if (remainingMs <= 0) break;
+      let mappingResponse: MappingResponse | null = null;
+      try {
+        mappingResponse = await fetchConversationMapping(
+          Runtime,
+          bootstrap.conversationId,
+          Math.min(DEFAULT_MAPPING_REQUEST_TIMEOUT_MS, remainingMs),
+        );
+      } catch {
+        // A transient page-context/CDP failure must not abort the browser turn.
+        // The existing DOM completion path remains the fallback authority.
+        lastReason = "mapping request failed";
+      }
+      if (stopped || eventGeneration !== generation) {
+        return { status: "unavailable", reason: "monitor stopped or reset" };
+      }
+      if (mappingResponse?.timedOut) {
+        lastReason = "mapping request timed out";
+      } else if (mappingResponse?.status === 200) {
+        const mapping = mappingResponse.body?.mapping;
+        if (!mapping || typeof mapping !== "object") {
+          lastReason = "mapping response missing mapping";
+        } else {
+          pollIntervalMs = readPollInterval(mapping, bootstrap.turnExchangeId, pollIntervalMs);
+          const verification = evaluateProTurnCompletion(mapping, bootstrap.turnExchangeId);
+          lastReason = verification.reason ?? "verified";
+          if (verification.done && verification.finalText && verification.finalMessageId) {
+            const answer = toStructuralAnswer(verification);
+            armed = false;
+            return answer
+              ? { status: "verified", answer }
+              : { status: "inconclusive", reason: "verified result missing answer fields" };
+          }
         }
       } else if (mappingResponse) {
         lastReason = `mapping request returned HTTP ${mappingResponse.status}`;
@@ -161,16 +268,19 @@ export function createProCompletionMonitor(
       await delayUntilNextPoll(Math.min(pollIntervalMs, Math.max(0, deadline - Date.now())));
     }
 
-    if (lastReason !== "verified") {
-      if (logger.verbose) logger(`[browser] structural completion inconclusive: ${lastReason}`);
+    armed = false;
+    if (lastReason !== "verified" && logger.verbose) {
+      logger(`[browser] structural completion inconclusive: ${lastReason}`);
     }
-    return null;
+    return { status: "inconclusive", reason: lastReason };
   };
 
   const stop = (): void => {
     if (stopped) return;
     stopped = true;
+    armed = false;
     generation += 1;
+    candidates.clear();
     handoffSignal.resolve(null);
     for (const remove of unsubscribe) {
       try {
@@ -181,7 +291,7 @@ export function createProCompletionMonitor(
     }
   };
 
-  return { reset, waitForCompletion, stop };
+  return { reset, arm, waitForCompletion, stop };
 }
 
 function toStructuralAnswer(result: ProTurnCompletion): ProStructuralAnswer | null {
@@ -227,28 +337,43 @@ export function extractStreamHandoff(sseText: string): StreamHandoff | null {
 async function fetchConversationMapping(
   Runtime: ChromeClient["Runtime"],
   conversationId: string,
-): Promise<{ status: number; body?: { mapping?: ConversationMapping } } | null> {
+  timeoutMs: number,
+): Promise<MappingResponse | null> {
+  const boundedTimeoutMs = Math.max(1, Math.floor(timeoutMs));
   const expression = `(async () => {
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    const timer = setTimeout(() => controller?.abort(), ${boundedTimeoutMs});
     try {
       const response = await fetch('/backend-api/conversation/' + encodeURIComponent(${JSON.stringify(conversationId)}), {
         credentials: 'include',
         headers: { Accept: 'application/json' },
+        signal: controller?.signal,
       });
       const text = await response.text();
       let body;
       try { body = text ? JSON.parse(text) : undefined; } catch (_error) { body = undefined; }
       return { status: response.status, body };
-    } catch (_error) {
-      return null;
+    } catch (error) {
+      return { status: 0, timedOut: error?.name === 'AbortError' };
+    } finally {
+      clearTimeout(timer);
     }
   })()`;
-  const result = await Runtime.evaluate({ expression, awaitPromise: true, returnByValue: true });
+  const result = await withTimeout(
+    Runtime.evaluate({ expression, awaitPromise: true, returnByValue: true }),
+    boundedTimeoutMs,
+  );
+  if (!result) return { status: 0, timedOut: true };
   const value = result.result?.value as
-    | { status?: unknown; body?: { mapping?: ConversationMapping } }
+    | { status?: unknown; body?: { mapping?: ConversationMapping }; timedOut?: unknown }
     | null
     | undefined;
   if (!value || typeof value.status !== "number") return null;
-  return { status: value.status, body: value.body };
+  return {
+    status: value.status,
+    body: value.body,
+    timedOut: value.timedOut === true,
+  };
 }
 
 function readPollInterval(
@@ -269,16 +394,21 @@ function readPollInterval(
 
 async function waitWithTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T | null> {
   if (timeoutMs <= 0) return null;
-  return await new Promise<T | null>((resolve) => {
+  return await withTimeout(promise, timeoutMs);
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T | null> {
+  if (timeoutMs <= 0) return null;
+  return await new Promise<T | null>((resolve, reject) => {
     const timer = setTimeout(() => resolve(null), timeoutMs);
     promise.then(
       (value) => {
         clearTimeout(timer);
         resolve(value);
       },
-      () => {
+      (error) => {
         clearTimeout(timer);
-        resolve(null);
+        reject(error);
       },
     );
   });

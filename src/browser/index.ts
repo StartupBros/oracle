@@ -556,11 +556,20 @@ const STRUCTURAL_COMPLETION_FALLBACK_TIMEOUT_MS = 90_000;
 async function waitForStructuralAssistantAnswer(
   monitor: ProCompletionMonitor,
   timeoutMs: number,
-): Promise<AssistantAnswer | null> {
-  const answer = await monitor.waitForCompletion(
+): Promise<
+  | { status: "verified"; answer: AssistantAnswer }
+  | { status: "unavailable" | "inconclusive"; reason: string }
+> {
+  const observation = await monitor.waitForCompletion(
     Math.min(Math.max(timeoutMs, 0), STRUCTURAL_COMPLETION_FALLBACK_TIMEOUT_MS),
   );
-  return answer ? structuralAnswerToAssistantAnswer(answer) : null;
+  if (observation.status === "verified") {
+    return {
+      status: "verified",
+      answer: structuralAnswerToAssistantAnswer(observation.answer),
+    };
+  }
+  return observation;
 }
 
 async function waitForAssistantOrGeneratedImageResponse(params: {
@@ -1652,6 +1661,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         attachmentTimeoutMs: config.attachmentTimeoutMs ?? undefined,
         baselineTurns: baselineTurns ?? undefined,
         attachmentNames: attachmentExpectations,
+        onPromptSend: () => proCompletionMonitor?.arm(),
         onPromptSubmitted: markPromptSubmitted,
       };
       const deepResearchTargetBaseline =
@@ -1946,11 +1956,35 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       label: string,
     ): Promise<BrowserConversationTurn & { answerHtml: string }> => {
       let turnAnswer: AssistantAnswer;
-      let structuralFallbackPromise: Promise<AssistantAnswer | null> | null = null;
       try {
         await updateConversationHint("assistant-wait", 15_000).catch(() => false);
-        turnAnswer = await waitWithThinkingMonitor(async () => {
-          const domPromise = raceWithDisconnect(
+        if (useStructuralCompletion && proCompletionMonitor && !imageOutputRequested) {
+          const structuralObservation = await waitWithThinkingMonitor(() =>
+            waitForStructuralAssistantAnswer(
+              proCompletionMonitor as ProCompletionMonitor,
+              config.timeoutMs,
+            ),
+          );
+          if (structuralObservation.status === "verified") {
+            logger("[browser] Captured answer via structural Pro completion proof");
+            proCompletionMonitor.reset();
+            await updateConversationHint("post-response", 15_000).catch(() => false);
+            return {
+              label,
+              answerText: structuralObservation.answer.text,
+              answerMarkdown: structuralObservation.answer.text,
+              answerHtml: "",
+            };
+          }
+          logger(
+            `[browser] Structural Pro completion unavailable/inconclusive (${structuralObservation.reason}); falling back to DOM completion`,
+          );
+          // A bounded structural timeout is an explicit fallback condition, not a
+          // reason to resubmit. Invalidate any late mapping callbacks before DOM capture.
+          proCompletionMonitor.reset();
+        }
+        turnAnswer = await waitWithThinkingMonitor(() =>
+          raceWithDisconnect(
             waitForAssistantOrGeneratedImageResponse({
               Runtime,
               waitForText: () =>
@@ -1968,49 +2002,8 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
               expectedConversationId: expectedConversationId(),
               imageOutputRequested,
             }),
-          ).then(
-            (value) => ({ source: "dom" as const, value }),
-            (error) => ({ source: "dom-error" as const, error }),
-          );
-          const structuralPromise =
-            useStructuralCompletion && proCompletionMonitor && !imageOutputRequested
-              ? waitForStructuralAssistantAnswer(proCompletionMonitor, config.timeoutMs).then(
-                  (value) => ({ source: "structural" as const, value }),
-                  () => ({ source: "structural" as const, value: null }),
-                )
-              : new Promise<{ source: "structural"; value: AssistantAnswer | null }>(() => {});
-          structuralFallbackPromise = structuralPromise.then((result) => result.value);
-          const first = await Promise.race([domPromise, structuralPromise]);
-          if (first.source === "structural" && first.value) {
-            logger("[browser] Captured answer via structural Pro completion proof");
-            proCompletionMonitor?.reset();
-            await updateConversationHint("post-response", 15_000).catch(() => false);
-            return first.value;
-          }
-          if (first.source === "structural") {
-            // Structural `done:false` is inconclusive, not a reason to re-submit.
-            const domResult = await domPromise;
-            if (domResult.source === "dom-error") throw domResult.error;
-            proCompletionMonitor?.reset();
-            return domResult.value;
-          }
-          if (first.source === "dom-error") {
-            const structuralResult = structuralFallbackPromise
-              ? await structuralFallbackPromise
-              : null;
-            if (structuralResult) {
-              logger(
-                "[browser] Recovered answer via structural Pro completion proof after DOM timeout",
-              );
-              proCompletionMonitor?.reset();
-              return structuralResult;
-            }
-            proCompletionMonitor?.reset();
-            throw first.error;
-          }
-          proCompletionMonitor?.reset();
-          return first.value;
-        });
+          ),
+        );
       } catch (error) {
         if (isAssistantResponseTimeoutError(error)) {
           const rechecked = await attemptAssistantRecheckOrRethrow(attemptAssistantRecheck);
@@ -3280,6 +3273,7 @@ async function runRemoteBrowserMode(
         attachmentTimeoutMs: config.attachmentTimeoutMs ?? undefined,
         baselineTurns: baselineTurns ?? undefined,
         attachmentNames: attachmentExpectations,
+        onPromptSend: () => proCompletionMonitor?.arm(),
         onPromptSubmitted: markPromptSubmitted,
       };
       const deepResearchTargetBaseline =
@@ -3534,11 +3528,35 @@ async function runRemoteBrowserMode(
       label: string,
     ): Promise<BrowserConversationTurn & { answerHtml: string }> => {
       let turnAnswer: AssistantAnswer;
-      let structuralFallbackPromise: Promise<AssistantAnswer | null> | null = null;
       try {
         await activeConversationUrlMonitor.update("assistant-wait", 15_000).catch(() => false);
-        turnAnswer = await waitWithThinkingMonitor(async () => {
-          const domPromise = waitForAssistantOrGeneratedImageResponse({
+        if (useStructuralCompletion && proCompletionMonitor && !imageOutputRequested) {
+          const structuralObservation = await waitWithThinkingMonitor(() =>
+            waitForStructuralAssistantAnswer(
+              proCompletionMonitor as ProCompletionMonitor,
+              config.timeoutMs,
+            ),
+          );
+          if (structuralObservation.status === "verified") {
+            logger("[browser] Captured answer via structural Pro completion proof");
+            proCompletionMonitor.reset();
+            await activeConversationUrlMonitor.update("post-response", 15_000).catch(() => false);
+            return {
+              label,
+              answerText: structuralObservation.answer.text,
+              answerMarkdown: structuralObservation.answer.text,
+              answerHtml: "",
+            };
+          }
+          logger(
+            `[browser] Structural Pro completion unavailable/inconclusive (${structuralObservation.reason}); falling back to DOM completion`,
+          );
+          // A bounded structural timeout is an explicit fallback condition, not a
+          // reason to resubmit. Invalidate any late mapping callbacks before DOM capture.
+          proCompletionMonitor.reset();
+        }
+        turnAnswer = await waitWithThinkingMonitor(() =>
+          waitForAssistantOrGeneratedImageResponse({
             Runtime,
             waitForText: () =>
               waitForAssistantResponseWithReload(
@@ -3554,49 +3572,8 @@ async function runRemoteBrowserMode(
             minTurnIndex: baselineTurns ?? undefined,
             expectedConversationId: expectedConversationId(),
             imageOutputRequested,
-          }).then(
-            (value) => ({ source: "dom" as const, value }),
-            (error) => ({ source: "dom-error" as const, error }),
-          );
-          const structuralPromise =
-            useStructuralCompletion && proCompletionMonitor && !imageOutputRequested
-              ? waitForStructuralAssistantAnswer(proCompletionMonitor, config.timeoutMs).then(
-                  (value) => ({ source: "structural" as const, value }),
-                  () => ({ source: "structural" as const, value: null }),
-                )
-              : new Promise<{ source: "structural"; value: AssistantAnswer | null }>(() => {});
-          structuralFallbackPromise = structuralPromise.then((result) => result.value);
-          const first = await Promise.race([domPromise, structuralPromise]);
-          if (first.source === "structural" && first.value) {
-            logger("[browser] Captured answer via structural Pro completion proof");
-            proCompletionMonitor?.reset();
-            await activeConversationUrlMonitor.update("post-response", 15_000).catch(() => false);
-            return first.value;
-          }
-          if (first.source === "structural") {
-            // Structural `done:false` is inconclusive, not a reason to re-submit.
-            const domResult = await domPromise;
-            if (domResult.source === "dom-error") throw domResult.error;
-            proCompletionMonitor?.reset();
-            return domResult.value;
-          }
-          if (first.source === "dom-error") {
-            const structuralResult = structuralFallbackPromise
-              ? await structuralFallbackPromise
-              : null;
-            if (structuralResult) {
-              logger(
-                "[browser] Recovered answer via structural Pro completion proof after DOM timeout",
-              );
-              proCompletionMonitor?.reset();
-              return structuralResult;
-            }
-            proCompletionMonitor?.reset();
-            throw first.error;
-          }
-          proCompletionMonitor?.reset();
-          return first.value;
-        });
+          }),
+        );
       } catch (error) {
         if (isAssistantResponseTimeoutError(error)) {
           const rechecked = await attemptAssistantRecheckOrRethrow(attemptAssistantRecheck);
