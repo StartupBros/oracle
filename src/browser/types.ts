@@ -118,6 +118,8 @@ export interface BrowserAutomationConfig {
   archiveConversations?: BrowserArchiveMode;
   /** Existing ChatGPT conversation URL to open before submitting the prompt. */
   resumeConversationUrl?: string | null;
+  /** Use the passive conversation mapping verifier for known Pro/reasoning turns. */
+  structuralCompletion?: boolean;
 }
 
 export interface BrowserRunOptions {
