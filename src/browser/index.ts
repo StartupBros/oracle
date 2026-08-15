@@ -561,6 +561,38 @@ function shouldUseStructuralCompletion(
 }
 
 const STRUCTURAL_COMPLETION_FALLBACK_TIMEOUT_MS = 90_000;
+const REMOTE_DISCONNECT_POLL_MS = 250;
+
+/**
+ * The remote path has no `raceWithDisconnect` helper (it never established one), but it does
+ * record socket loss in `connectionClosedUnexpectedly`. Poll that flag alongside the structural
+ * wait so a destroyed remote CDP context reaches the normal reattach path immediately.
+ */
+async function raceWithRemoteDisconnect<T extends { status: string; reason?: string }>(
+  work: Promise<T>,
+  isDisconnected: () => boolean,
+  onDisconnect: () => void,
+): Promise<T | { status: "unavailable"; reason: string }> {
+  let settled = false;
+  work.finally(() => {
+    settled = true;
+  });
+  const disconnected = new Promise<{ status: "unavailable"; reason: string }>((resolve) => {
+    const timer = setInterval(() => {
+      if (settled) {
+        clearInterval(timer);
+        return;
+      }
+      if (isDisconnected()) {
+        clearInterval(timer);
+        onDisconnect();
+        resolve({ status: "unavailable", reason: "remote browser connection lost" });
+      }
+    }, REMOTE_DISCONNECT_POLL_MS);
+    if (typeof timer.unref === "function") timer.unref();
+  });
+  return await Promise.race([work, disconnected]);
+}
 
 async function waitForStructuralAssistantAnswer(
   monitor: ProCompletionMonitor,
@@ -3549,10 +3581,16 @@ async function runRemoteBrowserMode(
       try {
         await activeConversationUrlMonitor.update("assistant-wait", 15_000).catch(() => false);
         if (useStructuralCompletion && proCompletionMonitor && !imageOutputRequested) {
+          // Mirror the local path: a dropped remote CDP socket must abort the structural
+          // wait immediately rather than draining the whole window into a retry loop.
           const structuralObservation = await waitWithThinkingMonitor(() =>
-            waitForStructuralAssistantAnswer(
-              proCompletionMonitor as ProCompletionMonitor,
-              config.timeoutMs,
+            raceWithRemoteDisconnect(
+              waitForStructuralAssistantAnswer(
+                proCompletionMonitor as ProCompletionMonitor,
+                config.timeoutMs,
+              ),
+              () => connectionClosedUnexpectedly,
+              () => proCompletionMonitor?.reset(),
             ),
           );
           if (structuralObservation.status === "verified") {

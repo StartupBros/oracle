@@ -264,6 +264,36 @@ describe("createProCompletionMonitor", () => {
     monitor.stop();
   }, 20_000);
 
+  test("retries a plain 404 while the conversation is still persisting", async () => {
+    const network = makeNetwork();
+    // The handoff can beat the conversation into existence: early 404s are a race, not a wall.
+    let call = 0;
+    const evaluate = vi.fn(async () => {
+      call += 1;
+      if (call <= 2) return { result: { value: { status: 404, body: undefined } } };
+      return { result: { value: { status: 200, body: { mapping: completedMapping() } } } };
+    });
+    const monitor = createProCompletionMonitor(
+      network as unknown as ChromeClient["Network"],
+      { evaluate } as unknown as ChromeClient["Runtime"],
+      vi.fn() as BrowserLogger,
+    );
+
+    monitor.reset();
+    monitor.arm();
+    const resultPromise = monitor.waitForCompletion(20_000);
+    await network.emitRequest({
+      requestId: "send-1",
+      request: { method: "POST", url: "https://chatgpt.com/backend-api/f/conversation" },
+    });
+    await network.emitResponse({ requestId: "send-1", response: { status: 200 } });
+    await network.emitFinished({ requestId: "send-1" });
+
+    await expect(resultPromise).resolves.toMatchObject({ status: "verified" });
+    expect(evaluate.mock.calls.length).toBeGreaterThan(2);
+    monitor.stop();
+  }, 30_000);
+
   test("hands off immediately on HTTP 429 instead of polling into the rate limit", async () => {
     const network = makeNetwork();
     const evaluate = vi.fn(async () => ({

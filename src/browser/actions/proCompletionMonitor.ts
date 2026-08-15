@@ -19,6 +19,8 @@ const DEFAULT_MAPPING_REQUEST_TIMEOUT_MS = 10_000;
  */
 const STRUCTURAL_CONFIRM_POLLS = 2;
 const STRUCTURAL_STABILITY_MS = 3_000;
+/** How long a plain 404 is treated as "conversation not persisted yet" rather than permanent. */
+const MAPPING_PERSISTENCE_GRACE_MS = 30_000;
 const MAX_CANDIDATE_REQUESTS = 8;
 const MAX_CANDIDATE_AGE_MS = 30_000;
 
@@ -240,6 +242,7 @@ export function createProCompletionMonitor(
     // looks complete while the turn is still running. Require the same final message to
     // survive consecutive polls before trusting it, mirroring the DOM gate's own
     // confirm-cycle pattern. Any non-terminal observation discards the candidate.
+    const pollingStartedAt = Date.now();
     let pendingAnswer: ProStructuralAnswer | null = null;
     let pendingFingerprint: string | null = null;
     let pendingConfirmations = 0;
@@ -313,7 +316,10 @@ export function createProCompletionMonitor(
         // Not recoverable by polling: stop early and let the DOM path own this turn.
         lastReason = `mapping request unauthorized (HTTP ${mappingResponse.status})`;
         break;
-      } else if (mappingResponse && isTerminalHttpStatus(mappingResponse.status)) {
+      } else if (
+        mappingResponse &&
+        shouldStopOnMappingStatus(mappingResponse.status, Date.now() - pollingStartedAt)
+      ) {
         // 429 in particular: continuing to poll every 1-10s delays DOM capture and can
         // extend the rate limit. Hand off immediately instead of retrying into the wall.
         lastReason = `mapping request returned HTTP ${mappingResponse.status}`;
@@ -378,8 +384,16 @@ function containsPrivateCitationMarkers(text: string): boolean {
   return /[\u{E000}-\u{F8FF}]/u.test(text);
 }
 
-/** 4xx responses will not become 200 by polling harder (429 included). */
-function isTerminalHttpStatus(status: number): boolean {
+/**
+ * Most 4xx responses will not become 200 by polling harder (429 included), so they hand the
+ * turn to DOM immediately. A PLAIN 404 is the exception: a Pro `stream_handoff` can arrive
+ * before the new conversation is visible through `/backend-api/conversation/<id>`, so an early
+ * 404 is an ordinary persistence race and must be retried for a bounded grace period. An
+ * auth-coded 404 is classified separately as `unauthorized` and never reaches this function.
+ * 5xx is treated as transient and keeps polling.
+ */
+function shouldStopOnMappingStatus(status: number, elapsedMs: number): boolean {
+  if (status === 404) return elapsedMs >= MAPPING_PERSISTENCE_GRACE_MS;
   return status >= 400 && status < 500;
 }
 
