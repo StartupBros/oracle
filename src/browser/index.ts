@@ -541,12 +541,21 @@ function structuralAnswerToAssistantAnswer(answer: {
   };
 }
 
+/**
+ * Structural completion may only arm for a turn that is verifiably Pro/reasoning.
+ *
+ * `thinkingTime` is part of that evidence, not a hint: the `gpt-5.5-pro` alias resolves to
+ * label `GPT-5.5` plus effort `pro`, so the labels alone never carry a Pro marker and a
+ * label-only test silently disables the verifier for the exact workflow it protects. Call
+ * this only AFTER `ensureThinkingTime()` has run — that step fails closed on an unconfirmed
+ * `pro` selection, so reaching it means the effort was actually selected.
+ */
 function shouldUseStructuralCompletion(
   config: ResolvedBrowserConfig,
   evidence: BrowserModelSelectionEvidence | undefined,
 ): boolean {
   if (!config.structuralCompletion || !evidence?.verified) return false;
-  return [evidence.requestedModel, evidence.resolvedLabel]
+  return [evidence.requestedModel, evidence.resolvedLabel, config.thinkingTime]
     .filter((value): value is string => typeof value === "string")
     .some((value) => /pro|thinking|reasoning/i.test(value));
 }
@@ -1546,10 +1555,6 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           : "Model picker: skipped (strategy=ignore)",
       );
     }
-    const useStructuralCompletion = shouldUseStructuralCompletion(config, modelSelectionEvidence);
-    if (useStructuralCompletion) {
-      logger("[browser] Structural Pro completion verifier enabled (DOM remains fallback)");
-    }
     const deepResearch = config.researchMode === "deep";
     // Handle thinking time selection if specified. Deep Research owns its own effort flow.
     const thinkingTime = config.thinkingTime;
@@ -1568,6 +1573,11 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           },
         }),
       );
+    }
+    // Evaluated after effort selection: the Pro alias carries its Pro-ness in thinkingTime.
+    const useStructuralCompletion = shouldUseStructuralCompletion(config, modelSelectionEvidence);
+    if (useStructuralCompletion) {
+      logger("[browser] Structural Pro completion verifier enabled (DOM remains fallback)");
     }
     const profileLockTimeoutMs = manualLogin ? (config.profileLockTimeoutMs ?? 0) : 0;
     let profileLock: ProfileRunLock | null = null;
@@ -3188,10 +3198,6 @@ async function runRemoteBrowserMode(
           : "Model picker: skipped (strategy=ignore)",
       );
     }
-    const useStructuralCompletion = shouldUseStructuralCompletion(config, modelSelectionEvidence);
-    if (useStructuralCompletion) {
-      logger("[browser] Structural Pro completion verifier enabled (DOM remains fallback)");
-    }
     const deepResearch = config.researchMode === "deep";
     // Handle thinking time selection if specified. Deep Research owns its own effort flow.
     const thinkingTime = config.thinkingTime;
@@ -3211,6 +3217,11 @@ async function runRemoteBrowserMode(
           },
         },
       );
+    }
+    // Evaluated after effort selection: the Pro alias carries its Pro-ness in thinkingTime.
+    const useStructuralCompletion = shouldUseStructuralCompletion(config, modelSelectionEvidence);
+    if (useStructuralCompletion) {
+      logger("[browser] Structural Pro completion verifier enabled (DOM remains fallback)");
     }
     const submitOnce = async (prompt: string, submissionAttachments: BrowserAttachment[]) => {
       const baselineSnapshot = await readAssistantSnapshot(Runtime).catch(() => null);

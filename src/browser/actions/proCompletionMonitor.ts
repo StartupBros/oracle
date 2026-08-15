@@ -11,6 +11,8 @@ const DEFAULT_POLL_INTERVAL_MS = 2_000;
 const MIN_POLL_INTERVAL_MS = 1_000;
 const MAX_POLL_INTERVAL_MS = 10_000;
 const DEFAULT_MAPPING_REQUEST_TIMEOUT_MS = 10_000;
+/** Additional consecutive polls that must repeat the same final message before it is trusted. */
+const STRUCTURAL_CONFIRM_POLLS = 1;
 const MAX_CANDIDATE_REQUESTS = 8;
 const MAX_CANDIDATE_AGE_MS = 30_000;
 
@@ -66,6 +68,7 @@ type MappingResponse = {
   status: number;
   body?: { mapping?: ConversationMapping };
   timedOut?: boolean;
+  unauthorized?: boolean;
 };
 
 function deferred<T>(): Deferred<T> {
@@ -226,6 +229,13 @@ export function createProCompletionMonitor(
 
     let pollIntervalMs = DEFAULT_POLL_INTERVAL_MS;
     let lastReason = "mapping not fetched";
+    // A single positive snapshot is NOT proof. Pro can emit a terminal-shaped interim
+    // text and only afterwards resume reasoning, so a mapping fetched inside that window
+    // looks complete while the turn is still running. Require the same final message to
+    // survive consecutive polls before trusting it, mirroring the DOM gate's own
+    // confirm-cycle pattern. Any non-terminal observation discards the candidate.
+    let pendingAnswer: ProStructuralAnswer | null = null;
+    let pendingConfirmations = 0;
     while (!stopped && eventGeneration === generation && Date.now() < deadline) {
       const remainingMs = Math.max(0, deadline - Date.now());
       if (remainingMs <= 0) break;
@@ -254,14 +264,29 @@ export function createProCompletionMonitor(
           pollIntervalMs = readPollInterval(mapping, bootstrap.turnExchangeId, pollIntervalMs);
           const verification = evaluateProTurnCompletion(mapping, bootstrap.turnExchangeId);
           lastReason = verification.reason ?? "verified";
-          if (verification.done && verification.finalText && verification.finalMessageId) {
-            const answer = toStructuralAnswer(verification);
-            armed = false;
-            return answer
-              ? { status: "verified", answer }
-              : { status: "inconclusive", reason: "verified result missing answer fields" };
+          const answer = toStructuralAnswer(verification);
+          if (answer) {
+            if (pendingAnswer && pendingAnswer.messageId === answer.messageId) {
+              pendingConfirmations += 1;
+            } else {
+              pendingAnswer = answer;
+              pendingConfirmations = 0;
+            }
+            if (pendingConfirmations >= STRUCTURAL_CONFIRM_POLLS) {
+              armed = false;
+              return { status: "verified", answer };
+            }
+            lastReason = "completion awaiting stability confirmation";
+          } else {
+            // Reasoning resumed (or the branch changed): the previous candidate was interim.
+            pendingAnswer = null;
+            pendingConfirmations = 0;
           }
         }
+      } else if (mappingResponse?.unauthorized) {
+        // Not recoverable by polling: stop early and let the DOM path own this turn.
+        lastReason = `mapping request unauthorized (HTTP ${mappingResponse.status})`;
+        break;
       } else if (mappingResponse) {
         lastReason = `mapping request returned HTTP ${mappingResponse.status}`;
       }
@@ -340,19 +365,63 @@ async function fetchConversationMapping(
   timeoutMs: number,
 ): Promise<MappingResponse | null> {
   const boundedTimeoutMs = Math.max(1, Math.floor(timeoutMs));
+  // The bearer token is read, cached, and used ENTIRELY inside the page: only the HTTP
+  // status and the conversation mapping cross back into Node. Cookies alone do not
+  // authenticate `/backend-api/conversation/<id>` — it answers 404
+  // `conversation_inaccessible` ("Log in to view this conversation"), so a cookie-only
+  // poll can never verify a real signed-in run.
   const expression = `(async () => {
+    const TOKEN_KEY = '__oracleStructuralCompletionToken';
     const controller = typeof AbortController === 'function' ? new AbortController() : null;
     const timer = setTimeout(() => controller?.abort(), ${boundedTimeoutMs});
-    try {
+    const isAuthFailure = (res) => {
+      if (!res) return false;
+      if (res.status === 401 || res.status === 403) return true;
+      const code = res.body && res.body.detail && res.body.detail.code;
+      return res.status === 404 && code === 'conversation_inaccessible';
+    };
+    const readToken = async (force) => {
+      if (!force && typeof globalThis[TOKEN_KEY] === 'string' && globalThis[TOKEN_KEY]) {
+        return globalThis[TOKEN_KEY];
+      }
+      try {
+        const session = await fetch('/api/auth/session', {
+          credentials: 'include',
+          signal: controller?.signal,
+        });
+        const parsed = await session.json().catch(() => null);
+        const token = parsed && typeof parsed.accessToken === 'string' ? parsed.accessToken : '';
+        globalThis[TOKEN_KEY] = token;
+        return token;
+      } catch (_error) {
+        return '';
+      }
+    };
+    const request = async (token) => {
+      const headers = { Accept: 'application/json' };
+      if (token) headers.Authorization = 'Bearer ' + token;
       const response = await fetch('/backend-api/conversation/' + encodeURIComponent(${JSON.stringify(conversationId)}), {
         credentials: 'include',
-        headers: { Accept: 'application/json' },
+        headers,
         signal: controller?.signal,
       });
       const text = await response.text();
       let body;
       try { body = text ? JSON.parse(text) : undefined; } catch (_error) { body = undefined; }
       return { status: response.status, body };
+    };
+    try {
+      let result = await request(await readToken(false));
+      if (isAuthFailure(result)) {
+        const refreshed = await readToken(true);
+        if (refreshed) result = await request(refreshed);
+      }
+      const mapping = result.body && result.body.mapping ? result.body.mapping : undefined;
+      return {
+        status: result.status,
+        body: mapping ? { mapping } : undefined,
+        unauthorized: isAuthFailure(result),
+      };
     } catch (error) {
       return { status: 0, timedOut: error?.name === 'AbortError' };
     } finally {
@@ -365,7 +434,12 @@ async function fetchConversationMapping(
   );
   if (!result) return { status: 0, timedOut: true };
   const value = result.result?.value as
-    | { status?: unknown; body?: { mapping?: ConversationMapping }; timedOut?: unknown }
+    | {
+        status?: unknown;
+        body?: { mapping?: ConversationMapping };
+        timedOut?: unknown;
+        unauthorized?: unknown;
+      }
     | null
     | undefined;
   if (!value || typeof value.status !== "number") return null;
@@ -373,6 +447,7 @@ async function fetchConversationMapping(
     status: value.status,
     body: value.body,
     timedOut: value.timedOut === true,
+    unauthorized: value.unauthorized === true,
   };
 }
 

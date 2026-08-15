@@ -154,10 +154,141 @@ describe("createProCompletionMonitor", () => {
         expression: expect.stringContaining("credentials: 'include'"),
       }),
     );
-    expect(evaluate.mock.calls[0]?.[0].expression).not.toContain("Authorization");
+    // The bearer is attached inside the page (cookies alone 404 on this endpoint); what
+    // must never happen is the token crossing back into Node. Node sees status + mapping.
+    expect(evaluate.mock.calls[0]?.[0].expression).toContain("/api/auth/session");
 
     monitor.stop();
     expect(network.removed).toEqual(["request", "response", "finished"]);
+  });
+
+  test("rejects an interim terminal snapshot that reasoning later invalidates", async () => {
+    const network = makeNetwork();
+    // Poll 1: looks complete. Poll 2: same turn resumed reasoning (the interim window).
+    // Poll 3+: the real final answer, stable across confirmation.
+    const interim = completedMapping();
+    interim.final.message.content.parts = ["Quick take: looks fine at a glance."];
+    const resumed = completedMapping();
+    resumed.final.message.content.parts = ["Quick take: looks fine at a glance."];
+    (resumed as unknown as Record<string, unknown>).resumed = {
+      id: "resumed",
+      parent: "final",
+      children: [],
+      message: {
+        id: "resumed-message",
+        author: { role: "assistant" },
+        recipient: "all",
+        content: { content_type: "thoughts", parts: ["Still working"] },
+        status: "in_progress",
+        metadata: { turn_exchange_id: TURN, reasoning_status: "is_reasoning" },
+      },
+    } as never;
+    const snapshots = [interim, resumed, completedMapping(), completedMapping()];
+    let call = 0;
+    const runtime = {
+      evaluate: vi.fn(async () => ({
+        result: {
+          value: {
+            status: 200,
+            body: { mapping: snapshots[Math.min(call++, snapshots.length - 1)] },
+          },
+        },
+      })),
+    } as unknown as ChromeClient["Runtime"];
+    const monitor = createProCompletionMonitor(
+      network as unknown as ChromeClient["Network"],
+      runtime,
+      vi.fn() as BrowserLogger,
+    );
+
+    monitor.reset();
+    monitor.arm();
+    const resultPromise = monitor.waitForCompletion(12_000);
+    await network.emitRequest({
+      requestId: "send-1",
+      request: { method: "POST", url: "https://chatgpt.com/backend-api/f/conversation" },
+    });
+    await network.emitResponse({ requestId: "send-1", response: { status: 200 } });
+    await network.emitFinished({ requestId: "send-1" });
+
+    const result = await resultPromise;
+    // The interim text must never be returned as the final answer.
+    expect(result).toMatchObject({ status: "verified" });
+    if (result.status === "verified") {
+      expect(result.answer.text).toBe("Verified Pro answer.");
+    }
+    monitor.stop();
+  });
+
+  test("authenticates the mapping poll in page context without leaking the token", async () => {
+    const network = makeNetwork();
+    const evaluate = vi.fn(async (_params: { expression: string }) => ({
+      result: { value: { status: 200, body: { mapping: completedMapping() } } },
+    }));
+    const logger = vi.fn() as BrowserLogger & { mock: { calls: unknown[][] } };
+    logger.verbose = true;
+    const monitor = createProCompletionMonitor(
+      network as unknown as ChromeClient["Network"],
+      { evaluate } as unknown as ChromeClient["Runtime"],
+      logger,
+    );
+
+    monitor.reset();
+    monitor.arm();
+    const resultPromise = monitor.waitForCompletion(12_000);
+    await network.emitRequest({
+      requestId: "send-1",
+      request: { method: "POST", url: "https://chatgpt.com/backend-api/f/conversation" },
+    });
+    await network.emitResponse({ requestId: "send-1", response: { status: 200 } });
+    await network.emitFinished({ requestId: "send-1" });
+    await expect(resultPromise).resolves.toMatchObject({ status: "verified" });
+
+    const expression = evaluate.mock.calls[0]?.[0].expression as string;
+    // Cookies alone 404 on this endpoint, so the bearer must be attached...
+    expect(expression).toContain("/api/auth/session");
+    expect(expression).toContain("'Bearer '");
+    expect(expression).toContain("credentials: 'include'");
+    // ...but the token is read and used only in-page; Node receives status + mapping.
+    expect(expression).toContain("globalThis[TOKEN_KEY]");
+    expect(logger.mock.calls.flat().join(" ")).not.toContain("Bearer");
+    monitor.stop();
+  });
+
+  test("stops polling and falls back when the mapping request is unauthorized", async () => {
+    const network = makeNetwork();
+    const evaluate = vi.fn(async () => ({
+      result: {
+        value: {
+          status: 404,
+          body: undefined,
+          unauthorized: true,
+        },
+      },
+    }));
+    const monitor = createProCompletionMonitor(
+      network as unknown as ChromeClient["Network"],
+      { evaluate } as unknown as ChromeClient["Runtime"],
+      vi.fn() as BrowserLogger,
+    );
+
+    monitor.reset();
+    monitor.arm();
+    const resultPromise = monitor.waitForCompletion(10_000);
+    await network.emitRequest({
+      requestId: "send-1",
+      request: { method: "POST", url: "https://chatgpt.com/backend-api/f/conversation" },
+    });
+    await network.emitResponse({ requestId: "send-1", response: { status: 200 } });
+    await network.emitFinished({ requestId: "send-1" });
+
+    await expect(resultPromise).resolves.toMatchObject({
+      status: "inconclusive",
+      reason: "mapping request unauthorized (HTTP 404)",
+    });
+    // It must give up immediately rather than burning the whole structural budget.
+    expect(evaluate).toHaveBeenCalledTimes(1);
+    monitor.stop();
   });
 
   test("fails closed when the mapping cannot prove completion", async () => {
@@ -366,7 +497,8 @@ describe("createProCompletionMonitor", () => {
     });
     monitor.reset();
     monitor.arm();
-    const resultPromise = monitor.waitForCompletion(25);
+    // Budget must cover the stability-confirmation poll, not just the first snapshot.
+    const resultPromise = monitor.waitForCompletion(12_000);
     await network.emitRequest({
       requestId: "current-send",
       request: { method: "POST", url: "https://chatgpt.com/backend-api/f/conversation" },
