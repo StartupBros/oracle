@@ -67,6 +67,8 @@ export interface BrowserConfigDefaults {
   manualLogin?: boolean;
   /** Manual-login profile directory override (also available via ORACLE_BROWSER_PROFILE_DIR). */
   manualLoginProfileDir?: string | null;
+  /** Opt-in passive backend completion proof for eligible Pro/reasoning turns. */
+  structuralCompletion?: boolean;
 }
 
 export interface AzureConfig {

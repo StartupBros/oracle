@@ -39,6 +39,7 @@ export async function submitPrompt(
     baselineTurns?: number | null;
     inputTimeoutMs?: number | null;
     attachmentTimeoutMs?: number | null;
+    onPromptSend?: () => Promise<void> | void;
     onPromptSubmitted?: () => Promise<void> | void;
   },
   prompt: string,
@@ -219,8 +220,10 @@ export async function submitPrompt(
     logger,
     deps?.attachmentNames,
     deps?.attachmentTimeoutMs,
+    deps?.onPromptSend,
   );
   if (!clicked) {
+    await deps.onPromptSend?.();
     await input.dispatchKeyEvent({
       type: "keyDown",
       ...ENTER_KEY_EVENT,
@@ -651,6 +654,7 @@ async function attemptSendButton(
   _logger?: BrowserLogger,
   attachmentNames?: AttachmentReadyInput[],
   attachmentTimeoutMs?: number | null,
+  onPromptSend?: () => Promise<void> | void,
 ): Promise<boolean> {
   const needAttachment = Array.isArray(attachmentNames) && attachmentNames.length > 0;
   const script = `(() => {
@@ -687,8 +691,7 @@ async function attemptSendButton(
       return { status: 'point', x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
     }
     // Last-resort fallback for unusual DOMs where the button is visible but has no useful rect.
-    dispatchClickSequence(button);
-    return { status: 'clicked' };
+    return { status: 'fallback' };
   })()`;
 
   // Give attachment-bearing submissions more headroom. ChatGPT's chip render can
@@ -709,7 +712,7 @@ async function attemptSendButton(
     }
     const { result } = await Runtime.evaluate({ expression: script, returnByValue: true });
     const value = result.value as
-      | { status?: "clicked" | "missing" | "point"; x?: number; y?: number }
+      | { status?: "clicked" | "fallback" | "missing" | "point"; x?: number; y?: number }
       | string
       | undefined;
     const status = typeof value === "string" ? value : value?.status;
@@ -719,11 +722,33 @@ async function attemptSendButton(
       typeof value.x === "number" &&
       typeof value.y === "number"
     ) {
+      await onPromptSend?.();
       await clickTrustedPoint(Runtime, Input, value.x, value.y);
       return true;
     }
     if (status === "clicked") {
+      await onPromptSend?.();
       return true;
+    }
+    if (status === "fallback") {
+      await onPromptSend?.();
+      const fallbackResult = await Runtime.evaluate({
+        expression: `(() => {
+          ${buildClickDispatcher()}
+          const selectors = ${JSON.stringify(SEND_BUTTON_SELECTORS)};
+          for (const selector of selectors) {
+            const button = document.querySelector(selector);
+            if (button instanceof HTMLElement) {
+              dispatchClickSequence(button);
+              return true;
+            }
+          }
+          return false;
+        })()`,
+        returnByValue: true,
+      });
+      if (fallbackResult.result?.value === true) return true;
+      return false;
     }
     if (status === "missing") {
       break;

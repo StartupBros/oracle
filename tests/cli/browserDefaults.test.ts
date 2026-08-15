@@ -9,6 +9,26 @@ import type { UserConfig } from "../../src/config.js";
 const source = (_key: keyof BrowserDefaultsOptions) => undefined;
 
 describe("applyBrowserDefaultsFromConfig", () => {
+  test("applies structural completion from user config when flags are absent", () => {
+    const options: BrowserDefaultsOptions = {};
+    const config: UserConfig = { browser: { structuralCompletion: true } };
+
+    applyBrowserDefaultsFromConfig(options, config, source);
+
+    expect(options.browserStructuralCompletion).toBe(true);
+  });
+
+  test("does not override structural completion when a CLI value is present", () => {
+    const options: BrowserDefaultsOptions = { browserStructuralCompletion: false };
+    const config: UserConfig = { browser: { structuralCompletion: true } };
+    const cliSource = (key: keyof BrowserDefaultsOptions) =>
+      key === "browserStructuralCompletion" ? "cli" : undefined;
+
+    applyBrowserDefaultsFromConfig(options, config, cliSource);
+
+    expect(options.browserStructuralCompletion).toBe(false);
+  });
+
   test("applies chatgptUrl from user config when flags are absent", () => {
     const options: BrowserDefaultsOptions = {};
     const config: UserConfig = {

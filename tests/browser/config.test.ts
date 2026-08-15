@@ -7,12 +7,14 @@ import { CHATGPT_URL, DEEP_RESEARCH_DEFAULT_TIMEOUT_MS } from "../../src/browser
 describe("resolveBrowserConfig", () => {
   const originalProfileDir = process.env.ORACLE_BROWSER_PROFILE_DIR;
   const originalMaxTabs = process.env.ORACLE_BROWSER_MAX_CONCURRENT_TABS;
+  const originalStructuralCompletion = process.env.ORACLE_STRUCTURAL_COMPLETION;
 
   beforeEach(() => {
     // Isolate from the caller's environment: a developer/CI export of the max-tabs
     // override must not leak into tests that assert built-in defaults. afterEach
     // below still restores the caller's original value once the suite finishes.
     delete process.env.ORACLE_BROWSER_MAX_CONCURRENT_TABS;
+    delete process.env.ORACLE_STRUCTURAL_COMPLETION;
   });
 
   afterEach(() => {
@@ -25,6 +27,11 @@ describe("resolveBrowserConfig", () => {
       delete process.env.ORACLE_BROWSER_MAX_CONCURRENT_TABS;
     } else {
       process.env.ORACLE_BROWSER_MAX_CONCURRENT_TABS = originalMaxTabs;
+    }
+    if (originalStructuralCompletion === undefined) {
+      delete process.env.ORACLE_STRUCTURAL_COMPLETION;
+    } else {
+      process.env.ORACLE_STRUCTURAL_COMPLETION = originalStructuralCompletion;
     }
   });
 
@@ -41,6 +48,14 @@ describe("resolveBrowserConfig", () => {
     expect(resolved.maxConcurrentTabs).toBe(3);
     expect(resolved.researchMode).toBe("off");
     expect(resolved.archiveConversations).toBe("auto");
+    expect(resolved.structuralCompletion).toBe(false);
+  });
+
+  test("resolves structural completion from config and environment", () => {
+    process.env.ORACLE_STRUCTURAL_COMPLETION = "1";
+    expect(resolveBrowserConfig(undefined).structuralCompletion).toBe(true);
+    expect(resolveBrowserConfig({ structuralCompletion: false }).structuralCompletion).toBe(false);
+    expect(resolveBrowserConfig({ structuralCompletion: true }).structuralCompletion).toBe(true);
   });
 
   test("applies overrides", () => {

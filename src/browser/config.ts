@@ -67,6 +67,7 @@ export const DEFAULT_BROWSER_CONFIG: ResolvedBrowserConfig = {
   researchMode: "off",
   archiveConversations: "auto",
   resumeConversationUrl: null,
+  structuralCompletion: false,
 };
 
 export function resolveBrowserConfig(
@@ -102,6 +103,10 @@ export function resolveBrowserConfig(
   );
   const researchMode = normalizeResearchMode(config?.researchMode);
   const archiveConversations = normalizeArchiveMode(config?.archiveConversations);
+  const structuralCompletion =
+    config?.structuralCompletion ??
+    parseBooleanEnv(process.env.ORACLE_STRUCTURAL_COMPLETION) ??
+    DEFAULT_BROWSER_CONFIG.structuralCompletion;
   const defaultTimeoutMs =
     researchMode === "deep" ? DEEP_RESEARCH_DEFAULT_TIMEOUT_MS : DEFAULT_BROWSER_CONFIG.timeoutMs;
   return {
@@ -153,6 +158,7 @@ export function resolveBrowserConfig(
     thinkingTime: config?.thinkingTime,
     researchMode,
     archiveConversations,
+    structuralCompletion,
     resumeConversationUrl:
       config?.resumeConversationUrl ?? DEFAULT_BROWSER_CONFIG.resumeConversationUrl,
     manualLogin,
@@ -168,6 +174,14 @@ function normalizeResearchMode(value: unknown): "off" | "deep" {
 
 function normalizeArchiveMode(value: unknown): "auto" | "always" | "never" {
   return value === "always" || value === "never" ? value : "auto";
+}
+
+function parseBooleanEnv(raw?: string | null): boolean | null {
+  if (!raw) return null;
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === "true" || normalized === "1") return true;
+  if (normalized === "false" || normalized === "0") return false;
+  return null;
 }
 
 function parseDebugPort(raw?: string | null): number | null {

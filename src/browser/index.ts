@@ -114,6 +114,10 @@ import {
   type ConversationUrlMonitor,
 } from "./conversationUrlMonitor.js";
 import {
+  createProCompletionMonitor,
+  type ProCompletionMonitor,
+} from "./actions/proCompletionMonitor.js";
+import {
   extractStableConversationIdFromUrl as extractConversationIdFromUrl,
   isStableConversationUrl as isConversationUrl,
 } from "./conversationUrl.js";
@@ -526,6 +530,88 @@ type AssistantAnswer = {
   html?: string;
   meta: { turnId?: string | null; messageId?: string | null };
 };
+
+function structuralAnswerToAssistantAnswer(answer: {
+  text: string;
+  messageId: string;
+}): AssistantAnswer {
+  return {
+    text: answer.text,
+    meta: { messageId: answer.messageId },
+  };
+}
+
+/**
+ * Structural completion may only arm for a turn that is verifiably Pro/reasoning.
+ *
+ * `thinkingTime` is part of that evidence, not a hint: the `gpt-5.5-pro` alias resolves to
+ * label `GPT-5.5` plus effort `pro`, so the labels alone never carry a Pro marker and a
+ * label-only test silently disables the verifier for the exact workflow it protects. Call
+ * this only AFTER `ensureThinkingTime()` has run — that step fails closed on an unconfirmed
+ * `pro` selection, so reaching it means the effort was actually selected.
+ */
+function shouldUseStructuralCompletion(
+  config: ResolvedBrowserConfig,
+  evidence: BrowserModelSelectionEvidence | undefined,
+): boolean {
+  if (!config.structuralCompletion || !evidence?.verified) return false;
+  return [evidence.requestedModel, evidence.resolvedLabel, config.thinkingTime]
+    .filter((value): value is string => typeof value === "string")
+    .some((value) => /pro|thinking|reasoning/i.test(value));
+}
+
+const STRUCTURAL_COMPLETION_FALLBACK_TIMEOUT_MS = 90_000;
+const REMOTE_DISCONNECT_POLL_MS = 250;
+
+/**
+ * The remote path has no `raceWithDisconnect` helper (it never established one), but it does
+ * record socket loss in `connectionClosedUnexpectedly`. Poll that flag alongside the structural
+ * wait so a destroyed remote CDP context reaches the normal reattach path immediately.
+ */
+async function raceWithRemoteDisconnect<T extends { status: string; reason?: string }>(
+  work: Promise<T>,
+  isDisconnected: () => boolean,
+  onDisconnect: () => void,
+): Promise<T | { status: "unavailable"; reason: string }> {
+  let settled = false;
+  work.finally(() => {
+    settled = true;
+  });
+  const disconnected = new Promise<{ status: "unavailable"; reason: string }>((resolve) => {
+    const timer = setInterval(() => {
+      if (settled) {
+        clearInterval(timer);
+        return;
+      }
+      if (isDisconnected()) {
+        clearInterval(timer);
+        onDisconnect();
+        resolve({ status: "unavailable", reason: "remote browser connection lost" });
+      }
+    }, REMOTE_DISCONNECT_POLL_MS);
+    if (typeof timer.unref === "function") timer.unref();
+  });
+  return await Promise.race([work, disconnected]);
+}
+
+async function waitForStructuralAssistantAnswer(
+  monitor: ProCompletionMonitor,
+  timeoutMs: number,
+): Promise<
+  | { status: "verified"; answer: AssistantAnswer }
+  | { status: "unavailable" | "inconclusive"; reason: string }
+> {
+  const observation = await monitor.waitForCompletion(
+    Math.min(Math.max(timeoutMs, 0), STRUCTURAL_COMPLETION_FALLBACK_TIMEOUT_MS),
+  );
+  if (observation.status === "verified") {
+    return {
+      status: "verified",
+      answer: structuralAnswerToAssistantAnswer(observation.answer),
+    };
+  }
+  return observation;
+}
 
 async function waitForAssistantOrGeneratedImageResponse(params: {
   Runtime: ChromeClient["Runtime"];
@@ -952,6 +1038,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
   let modelSelectionEvidence: BrowserModelSelectionEvidence | undefined;
   let tabLease: BrowserTabLease | null = null;
   let conversationUrlMonitor: ConversationUrlMonitor | null = null;
+  let proCompletionMonitor: ProCompletionMonitor | null = null;
   const emitRuntimeHint = async (): Promise<void> => {
     if (!chrome?.port) {
       return;
@@ -1234,6 +1321,9 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     const raceWithDisconnect = <T>(promise: Promise<T>): Promise<T> =>
       Promise.race([promise, disconnectPromise]);
     const { Network, Page, Runtime, Input, DOM, Target } = client;
+    proCompletionMonitor = config.structuralCompletion
+      ? createProCompletionMonitor(Network, Runtime, logger)
+      : null;
 
     const domainEnablers = [Network.enable({}), Page.enable(), Runtime.enable()];
     if (DOM && typeof DOM.enable === "function") {
@@ -1516,6 +1606,11 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         }),
       );
     }
+    // Evaluated after effort selection: the Pro alias carries its Pro-ness in thinkingTime.
+    const useStructuralCompletion = shouldUseStructuralCompletion(config, modelSelectionEvidence);
+    if (useStructuralCompletion) {
+      logger("[browser] Structural Pro completion verifier enabled (DOM remains fallback)");
+    }
     const profileLockTimeoutMs = manualLogin ? (config.profileLockTimeoutMs ?? 0) : 0;
     let profileLock: ProfileRunLock | null = null;
     const acquireProfileLockIfNeeded = async () => {
@@ -1595,6 +1690,9 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         );
       }
       let baselineTurns = await readConversationTurnCount(Runtime, logger);
+      // Each submission gets a fresh wire-level binding. A failed composer retry must not
+      // reuse the previous turn's conversation request or turn_exchange_id.
+      proCompletionMonitor?.reset();
       // Learned: return baselineTurns so assistant polling can ignore earlier content.
       const providerState: Record<string, unknown> = {
         runtime: Runtime,
@@ -1605,6 +1703,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         attachmentTimeoutMs: config.attachmentTimeoutMs ?? undefined,
         baselineTurns: baselineTurns ?? undefined,
         attachmentNames: attachmentExpectations,
+        onPromptSend: () => proCompletionMonitor?.arm(),
         onPromptSubmitted: markPromptSubmitted,
       };
       const deepResearchTargetBaseline =
@@ -1901,6 +2000,38 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       let turnAnswer: AssistantAnswer;
       try {
         await updateConversationHint("assistant-wait", 15_000).catch(() => false);
+        if (useStructuralCompletion && proCompletionMonitor && !imageOutputRequested) {
+          // Race the disconnect watcher: a destroyed CDP context must reach the normal
+          // reattach path immediately, not after the whole structural window drains.
+          const structuralObservation = await waitWithThinkingMonitor(() =>
+            raceWithDisconnect(
+              waitForStructuralAssistantAnswer(
+                proCompletionMonitor as ProCompletionMonitor,
+                config.timeoutMs,
+              ),
+            ),
+          ).catch((error) => {
+            proCompletionMonitor?.reset();
+            throw error;
+          });
+          if (structuralObservation.status === "verified") {
+            logger("[browser] Captured answer via structural Pro completion proof");
+            proCompletionMonitor.reset();
+            await updateConversationHint("post-response", 15_000).catch(() => false);
+            return {
+              label,
+              answerText: structuralObservation.answer.text,
+              answerMarkdown: structuralObservation.answer.text,
+              answerHtml: "",
+            };
+          }
+          logger(
+            `[browser] Structural Pro completion unavailable/inconclusive (${structuralObservation.reason}); falling back to DOM completion`,
+          );
+          // A bounded structural timeout is an explicit fallback condition, not a
+          // reason to resubmit. Invalidate any late mapping callbacks before DOM capture.
+          proCompletionMonitor.reset();
+        }
         turnAnswer = await waitWithThinkingMonitor(() =>
           raceWithDisconnect(
             waitForAssistantOrGeneratedImageResponse({
@@ -2383,6 +2514,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       normalizedError,
     );
   } finally {
+    proCompletionMonitor?.stop();
     await conversationUrlMonitor?.stop();
     try {
       if (!connectionClosedUnexpectedly) {
@@ -2887,6 +3019,7 @@ async function runRemoteBrowserMode(
   let attachedExistingTab = false;
   let ownsTarget = true;
   let conversationUrlMonitor: ConversationUrlMonitor | null = null;
+  let proCompletionMonitor: ProCompletionMonitor | null = null;
   const runtimeHintCb = options.runtimeHintCb;
   const emitRuntimeHint = async () => {
     if (!runtimeHintCb) return;
@@ -2993,6 +3126,9 @@ async function runRemoteBrowserMode(
     };
     client.on("disconnect", markConnectionLost);
     const { Network, Page, Runtime, Input, DOM, Target } = client;
+    proCompletionMonitor = config.structuralCompletion
+      ? createProCompletionMonitor(Network, Runtime, logger)
+      : null;
 
     const domainEnablers = [Network.enable({}), Page.enable(), Runtime.enable()];
     if (DOM && typeof DOM.enable === "function") {
@@ -3121,6 +3257,11 @@ async function runRemoteBrowserMode(
         },
       );
     }
+    // Evaluated after effort selection: the Pro alias carries its Pro-ness in thinkingTime.
+    const useStructuralCompletion = shouldUseStructuralCompletion(config, modelSelectionEvidence);
+    if (useStructuralCompletion) {
+      logger("[browser] Structural Pro completion verifier enabled (DOM remains fallback)");
+    }
     const submitOnce = async (prompt: string, submissionAttachments: BrowserAttachment[]) => {
       const baselineSnapshot = await readAssistantSnapshot(Runtime).catch(() => null);
       const baselineAssistantText =
@@ -3170,6 +3311,9 @@ async function runRemoteBrowserMode(
         );
       }
       let baselineTurns = await readConversationTurnCount(Runtime, logger);
+      // Each submission gets a fresh wire-level binding. A failed composer retry must not
+      // reuse the previous turn's conversation request or turn_exchange_id.
+      proCompletionMonitor?.reset();
       const providerState: Record<string, unknown> = {
         runtime: Runtime,
         input: Input,
@@ -3179,6 +3323,7 @@ async function runRemoteBrowserMode(
         attachmentTimeoutMs: config.attachmentTimeoutMs ?? undefined,
         baselineTurns: baselineTurns ?? undefined,
         attachmentNames: attachmentExpectations,
+        onPromptSend: () => proCompletionMonitor?.arm(),
         onPromptSubmitted: markPromptSubmitted,
       };
       const deepResearchTargetBaseline =
@@ -3435,6 +3580,37 @@ async function runRemoteBrowserMode(
       let turnAnswer: AssistantAnswer;
       try {
         await activeConversationUrlMonitor.update("assistant-wait", 15_000).catch(() => false);
+        if (useStructuralCompletion && proCompletionMonitor && !imageOutputRequested) {
+          // Mirror the local path: a dropped remote CDP socket must abort the structural
+          // wait immediately rather than draining the whole window into a retry loop.
+          const structuralObservation = await waitWithThinkingMonitor(() =>
+            raceWithRemoteDisconnect(
+              waitForStructuralAssistantAnswer(
+                proCompletionMonitor as ProCompletionMonitor,
+                config.timeoutMs,
+              ),
+              () => connectionClosedUnexpectedly,
+              () => proCompletionMonitor?.reset(),
+            ),
+          );
+          if (structuralObservation.status === "verified") {
+            logger("[browser] Captured answer via structural Pro completion proof");
+            proCompletionMonitor.reset();
+            await activeConversationUrlMonitor.update("post-response", 15_000).catch(() => false);
+            return {
+              label,
+              answerText: structuralObservation.answer.text,
+              answerMarkdown: structuralObservation.answer.text,
+              answerHtml: "",
+            };
+          }
+          logger(
+            `[browser] Structural Pro completion unavailable/inconclusive (${structuralObservation.reason}); falling back to DOM completion`,
+          );
+          // A bounded structural timeout is an explicit fallback condition, not a
+          // reason to resubmit. Invalidate any late mapping callbacks before DOM capture.
+          proCompletionMonitor.reset();
+        }
         turnAnswer = await waitWithThinkingMonitor(() =>
           waitForAssistantOrGeneratedImageResponse({
             Runtime,
@@ -3809,6 +3985,7 @@ async function runRemoteBrowserMode(
       },
     });
   } finally {
+    proCompletionMonitor?.stop();
     await conversationUrlMonitor?.stop();
     try {
       await closeRemoteConnectionAfterRun({
