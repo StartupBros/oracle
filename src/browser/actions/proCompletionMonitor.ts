@@ -11,8 +11,14 @@ const DEFAULT_POLL_INTERVAL_MS = 2_000;
 const MIN_POLL_INTERVAL_MS = 1_000;
 const MAX_POLL_INTERVAL_MS = 10_000;
 const DEFAULT_MAPPING_REQUEST_TIMEOUT_MS = 10_000;
-/** Additional consecutive polls that must repeat the same final message before it is trusted. */
-const STRUCTURAL_CONFIRM_POLLS = 1;
+/**
+ * Additional consecutive polls that must repeat the IDENTICAL answer fingerprint before it is
+ * trusted, plus a minimum quiet window. Pro emits terminal-shaped interim texts and only then
+ * resumes reasoning, and streaming text accumulates under a stable message id — so neither id
+ * equality nor a single repeat proves the turn is finished.
+ */
+const STRUCTURAL_CONFIRM_POLLS = 2;
+const STRUCTURAL_STABILITY_MS = 3_000;
 const MAX_CANDIDATE_REQUESTS = 8;
 const MAX_CANDIDATE_AGE_MS = 30_000;
 
@@ -235,7 +241,9 @@ export function createProCompletionMonitor(
     // survive consecutive polls before trusting it, mirroring the DOM gate's own
     // confirm-cycle pattern. Any non-terminal observation discards the candidate.
     let pendingAnswer: ProStructuralAnswer | null = null;
+    let pendingFingerprint: string | null = null;
     let pendingConfirmations = 0;
+    let pendingSince = 0;
     while (!stopped && eventGeneration === generation && Date.now() < deadline) {
       const remainingMs = Math.max(0, deadline - Date.now());
       if (remainingMs <= 0) break;
@@ -266,13 +274,30 @@ export function createProCompletionMonitor(
           lastReason = verification.reason ?? "verified";
           const answer = toStructuralAnswer(verification);
           if (answer) {
-            if (pendingAnswer && pendingAnswer.messageId === answer.messageId) {
+            if (containsPrivateCitationMarkers(answer.text)) {
+              // Raw mapping text keeps ChatGPT's private-use citation wrappers, which the
+              // DOM copy path normalizes away. Hand the turn to DOM rather than persist them.
+              armed = false;
+              return { status: "inconclusive", reason: "answer contains private citation markers" };
+            }
+            // Fingerprint the whole answer, not just the id: streaming text accumulates under a
+            // STABLE message id, so id equality alone proves nothing. Require the identical
+            // fingerprint across consecutive polls AND a minimum quiet window, so an
+            // interim → interim → resumed-reasoning sequence cannot satisfy confirmation.
+            const fingerprint = answerFingerprint(answer);
+            if (pendingAnswer && pendingFingerprint === fingerprint) {
               pendingConfirmations += 1;
             } else {
               pendingAnswer = answer;
+              pendingFingerprint = fingerprint;
               pendingConfirmations = 0;
+              pendingSince = Date.now();
             }
-            if (pendingConfirmations >= STRUCTURAL_CONFIRM_POLLS) {
+            const quietForMs = Date.now() - pendingSince;
+            if (
+              pendingConfirmations >= STRUCTURAL_CONFIRM_POLLS &&
+              quietForMs >= STRUCTURAL_STABILITY_MS
+            ) {
               armed = false;
               return { status: "verified", answer };
             }
@@ -280,12 +305,18 @@ export function createProCompletionMonitor(
           } else {
             // Reasoning resumed (or the branch changed): the previous candidate was interim.
             pendingAnswer = null;
+            pendingFingerprint = null;
             pendingConfirmations = 0;
           }
         }
       } else if (mappingResponse?.unauthorized) {
         // Not recoverable by polling: stop early and let the DOM path own this turn.
         lastReason = `mapping request unauthorized (HTTP ${mappingResponse.status})`;
+        break;
+      } else if (mappingResponse && isTerminalHttpStatus(mappingResponse.status)) {
+        // 429 in particular: continuing to poll every 1-10s delays DOM capture and can
+        // extend the rate limit. Hand off immediately instead of retrying into the wall.
+        lastReason = `mapping request returned HTTP ${mappingResponse.status}`;
         break;
       } else if (mappingResponse) {
         lastReason = `mapping request returned HTTP ${mappingResponse.status}`;
@@ -327,6 +358,29 @@ function toStructuralAnswer(result: ProTurnCompletion): ProStructuralAnswer | nu
     modelSlug: result.modelSlug,
     finishReason: result.finishReason,
   };
+}
+
+function answerFingerprint(answer: ProStructuralAnswer): string {
+  return [
+    answer.messageId,
+    answer.finishReason ?? "",
+    String(answer.text.length),
+    answer.text,
+  ].join(" ");
+}
+
+/**
+ * ChatGPT wraps citations in Unicode private-use markers that the DOM copy path strips.
+ * The structural path reads raw mapping text, so it must not persist them verbatim.
+ */
+function containsPrivateCitationMarkers(text: string): boolean {
+  // Private Use Area (U+E000-U+F8FF) covers the citation wrappers ChatGPT emits.
+  return /[\u{E000}-\u{F8FF}]/u.test(text);
+}
+
+/** 4xx responses will not become 200 by polling harder (429 included). */
+function isTerminalHttpStatus(status: number): boolean {
+  return status >= 400 && status < 500;
 }
 
 function isConversationSubmissionUrl(url: string | undefined): boolean {

@@ -125,7 +125,7 @@ describe("createProCompletionMonitor", () => {
 
     monitor.reset();
     monitor.arm();
-    const resultPromise = monitor.waitForCompletion(5_000);
+    const resultPromise = monitor.waitForCompletion(12_000);
     await network.emitRequest({
       requestId: "ignored-get",
       request: { method: "GET", url: "https://chatgpt.com/backend-api/f/conversation" },
@@ -183,7 +183,17 @@ describe("createProCompletionMonitor", () => {
         metadata: { turn_exchange_id: TURN, reasoning_status: "is_reasoning" },
       },
     } as never;
-    const snapshots = [interim, resumed, completedMapping(), completedMapping()];
+    // Two interim snapshots BEFORE reasoning resumes: a repeat alone must not confirm.
+    const snapshots = [
+      interim,
+      interim,
+      resumed,
+      completedMapping(),
+      completedMapping(),
+      completedMapping(),
+      completedMapping(),
+      completedMapping(),
+    ];
     let call = 0;
     const runtime = {
       evaluate: vi.fn(async () => ({
@@ -203,7 +213,7 @@ describe("createProCompletionMonitor", () => {
 
     monitor.reset();
     monitor.arm();
-    const resultPromise = monitor.waitForCompletion(12_000);
+    const resultPromise = monitor.waitForCompletion(20_000);
     await network.emitRequest({
       requestId: "send-1",
       request: { method: "POST", url: "https://chatgpt.com/backend-api/f/conversation" },
@@ -217,6 +227,103 @@ describe("createProCompletionMonitor", () => {
     if (result.status === "verified") {
       expect(result.answer.text).toBe("Verified Pro answer.");
     }
+    monitor.stop();
+  }, 30_000);
+
+  test("does not confirm while streaming text still grows under a stable message id", async () => {
+    const network = makeNetwork();
+    // Same message id every poll, but the text keeps accumulating: never stable, never final.
+    let call = 0;
+    const runtime = {
+      evaluate: vi.fn(async () => {
+        const mapping = completedMapping();
+        mapping.final.message.content.parts = ["Partial answer".padEnd(20 + call++ * 10, ".")];
+        return { result: { value: { status: 200, body: { mapping } } } };
+      }),
+    } as unknown as ChromeClient["Runtime"];
+    const monitor = createProCompletionMonitor(
+      network as unknown as ChromeClient["Network"],
+      runtime,
+      vi.fn() as BrowserLogger,
+    );
+
+    monitor.reset();
+    monitor.arm();
+    const resultPromise = monitor.waitForCompletion(6_000);
+    await network.emitRequest({
+      requestId: "send-1",
+      request: { method: "POST", url: "https://chatgpt.com/backend-api/f/conversation" },
+    });
+    await network.emitResponse({ requestId: "send-1", response: { status: 200 } });
+    await network.emitFinished({ requestId: "send-1" });
+
+    await expect(resultPromise).resolves.toMatchObject({
+      status: "inconclusive",
+      reason: "completion awaiting stability confirmation",
+    });
+    monitor.stop();
+  }, 20_000);
+
+  test("hands off immediately on HTTP 429 instead of polling into the rate limit", async () => {
+    const network = makeNetwork();
+    const evaluate = vi.fn(async () => ({
+      result: { value: { status: 429, body: undefined } },
+    }));
+    const monitor = createProCompletionMonitor(
+      network as unknown as ChromeClient["Network"],
+      { evaluate } as unknown as ChromeClient["Runtime"],
+      vi.fn() as BrowserLogger,
+    );
+
+    monitor.reset();
+    monitor.arm();
+    const resultPromise = monitor.waitForCompletion(10_000);
+    await network.emitRequest({
+      requestId: "send-1",
+      request: { method: "POST", url: "https://chatgpt.com/backend-api/f/conversation" },
+    });
+    await network.emitResponse({ requestId: "send-1", response: { status: 200 } });
+    await network.emitFinished({ requestId: "send-1" });
+
+    await expect(resultPromise).resolves.toMatchObject({
+      status: "inconclusive",
+      reason: "mapping request returned HTTP 429",
+    });
+    expect(evaluate).toHaveBeenCalledTimes(1);
+    monitor.stop();
+  });
+
+  test("defers to DOM when the mapping text carries private citation markers", async () => {
+    const network = makeNetwork();
+    const runtime = {
+      evaluate: vi.fn(async () => {
+        const mapping = completedMapping();
+        const open = String.fromCodePoint(0xe200);
+        const close = String.fromCodePoint(0xe201);
+        mapping.final.message.content.parts = ["See " + open + "cite" + close + " for details."];
+        return { result: { value: { status: 200, body: { mapping } } } };
+      }),
+    } as unknown as ChromeClient["Runtime"];
+    const monitor = createProCompletionMonitor(
+      network as unknown as ChromeClient["Network"],
+      runtime,
+      vi.fn() as BrowserLogger,
+    );
+
+    monitor.reset();
+    monitor.arm();
+    const resultPromise = monitor.waitForCompletion(10_000);
+    await network.emitRequest({
+      requestId: "send-1",
+      request: { method: "POST", url: "https://chatgpt.com/backend-api/f/conversation" },
+    });
+    await network.emitResponse({ requestId: "send-1", response: { status: 200 } });
+    await network.emitFinished({ requestId: "send-1" });
+
+    await expect(resultPromise).resolves.toMatchObject({
+      status: "inconclusive",
+      reason: "answer contains private citation markers",
+    });
     monitor.stop();
   });
 
@@ -422,7 +529,7 @@ describe("createProCompletionMonitor", () => {
 
     monitor.reset();
     monitor.arm();
-    const resultPromise = monitor.waitForCompletion(5_000);
+    const resultPromise = monitor.waitForCompletion(12_000);
     await network.emitRequest({
       requestId: "auxiliary-post",
       request: { method: "POST", url: "https://chatgpt.com/backend-api/f/conversation" },
@@ -464,7 +571,7 @@ describe("createProCompletionMonitor", () => {
       request: { method: "POST", url: "https://chatgpt.com/backend-api/f/conversation" },
     });
     monitor.arm();
-    const resultPromise = monitor.waitForCompletion(5_000);
+    const resultPromise = monitor.waitForCompletion(12_000);
     await network.emitRequest({
       requestId: "intended-after-arm",
       request: { method: "POST", url: "https://chatgpt.com/backend-api/f/conversation" },

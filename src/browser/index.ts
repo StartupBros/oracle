@@ -1969,12 +1969,19 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       try {
         await updateConversationHint("assistant-wait", 15_000).catch(() => false);
         if (useStructuralCompletion && proCompletionMonitor && !imageOutputRequested) {
+          // Race the disconnect watcher: a destroyed CDP context must reach the normal
+          // reattach path immediately, not after the whole structural window drains.
           const structuralObservation = await waitWithThinkingMonitor(() =>
-            waitForStructuralAssistantAnswer(
-              proCompletionMonitor as ProCompletionMonitor,
-              config.timeoutMs,
+            raceWithDisconnect(
+              waitForStructuralAssistantAnswer(
+                proCompletionMonitor as ProCompletionMonitor,
+                config.timeoutMs,
+              ),
             ),
-          );
+          ).catch((error) => {
+            proCompletionMonitor?.reset();
+            throw error;
+          });
           if (structuralObservation.status === "verified") {
             logger("[browser] Captured answer via structural Pro completion proof");
             proCompletionMonitor.reset();
