@@ -467,6 +467,8 @@ function buildAttachmentReadyExpression(attachmentNames: AttachmentReadyInput[])
       'button[aria-label*="Remove attachment"]',
       '[aria-label*="remove attachment"]',
       'button[aria-label*="remove attachment"]',
+      // ChatGPT also renders uploaded tiles as a bare "Remove <filename>" button.
+      'button[aria-label^="Remove "]',
     ];
     const sendButton = sendSelectors
       .map((selector) => document.querySelector(selector))
@@ -553,7 +555,16 @@ function buildAttachmentReadyExpression(attachmentNames: AttachmentReadyInput[])
       return collected;
     };
     const chipNodes = collectChipNodes();
-    const chipLabels = chipNodes.map((node) => collectLabelHaystack(node));
+    const chipLabels = chipNodes.map((node) => {
+      // A removal control is sufficient evidence only for the filename in its own label.
+      // Its parent may also contain the prompt, which could mention an unattached file.
+      const removeLabel = node.tagName?.toLowerCase() === 'button'
+        ? node.getAttribute('aria-label') || ''
+        : '';
+      return /^remove /i.test(removeLabel)
+        ? removeLabel.toLowerCase()
+        : collectLabelHaystack(node);
+    });
     const uploadEvidence = ${buildAttachmentEvidenceExpression(attachmentExpectations.map((item) => item.name))};
     const chipsReady = (() => {
       const used = new Set();
@@ -764,9 +775,14 @@ async function activateExactAttachmentSendButton(
   attachmentNavigationUrl?: string,
   attachmentNames: AttachmentReadyInput[] = [],
 ): Promise<boolean> {
+  const exactSendSelectors = [
+    'button[data-testid="send-button"]',
+    'form button[type="submit"][aria-label="Send"]',
+  ];
   const probe = await Runtime.evaluate({
     expression: `(() => {
-      const button = document.querySelector('button[data-testid="send-button"]');
+      const selectors = ${JSON.stringify(exactSendSelectors)};
+      const button = selectors.map((selector) => document.querySelector(selector)).find(Boolean);
       if (!(button instanceof HTMLElement)) return { status: 'absent' };
       const rect = button.getBoundingClientRect();
       const style = window.getComputedStyle(button);
@@ -808,7 +824,8 @@ async function activateExactAttachmentSendButton(
   try {
     const boundary = await Runtime.evaluate({
       expression: `(() => {
-        const button = document.querySelector('button[data-testid="send-button"]');
+        const selectors = ${JSON.stringify(exactSendSelectors)};
+        const button = selectors.map((selector) => document.querySelector(selector)).find(Boolean);
         const check = () => {
           const navigation = ${buildComposerNavigationValidationExpression(attachmentNavigationUrl)};
           const rect = button?.getBoundingClientRect();
@@ -816,7 +833,7 @@ async function activateExactAttachmentSendButton(
           return {
             ...navigation,
             focused: button instanceof HTMLElement && document.activeElement === button &&
-              document.querySelector('button[data-testid="send-button"]') === button &&
+              selectors.map((selector) => document.querySelector(selector)).find(Boolean) === button &&
               !button.hasAttribute('disabled') && button.getAttribute('aria-disabled') !== 'true' &&
               button.getAttribute('data-disabled') !== 'true' && rect.width > 0 && rect.height > 0 &&
               style.display !== 'none' && style.visibility !== 'hidden' && style.pointerEvents !== 'none',
@@ -852,7 +869,8 @@ async function activateExactAttachmentSendButton(
         };
         const onClick = event => {
           if (!guard.sawKeyDown || !(event.target instanceof Node) ||
-              !(button.contains(event.target) || event.target instanceof Element && event.target.closest('button[data-testid="send-button"]'))) return;
+              !(button.contains(event.target) || event.target instanceof Element &&
+                selectors.some((selector) => event.target.closest(selector) === button))) return;
           const state = safeCheck();
           if (guard.blocked || !state.contextMatches || !state.focused || !state.attachmentsReady) cancel(event, guard.blocked ?? state);
           detach();

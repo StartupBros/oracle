@@ -383,7 +383,7 @@ describe("promptComposer", () => {
           if (expression.includes("return !selectors.some")) {
             return { result: { value: true } };
           }
-          if (expression.includes('button[data-testid="send-button"]')) {
+          if (expression.includes("send-button") && expression.includes("const selectors")) {
             events.push("focusSendButton");
             return { result: { value: { status: "focused" } } };
           }
@@ -469,7 +469,7 @@ describe("promptComposer", () => {
           if (expression.includes("composer-plus-btn")) {
             return { result: { value: { status: "closed" } } };
           }
-          if (expression.includes('button[data-testid="send-button"]')) {
+          if (expression.includes("send-button") && expression.includes("const selectors")) {
             return { result: { value: { status: "focused" } } };
           }
           if (expression.includes("currentUrl: location.href")) {
@@ -542,7 +542,7 @@ describe("promptComposer", () => {
           if (expression.includes("composer-plus-btn")) {
             return { result: { value: { status: "closed" } } };
           }
-          if (expression.includes('button[data-testid="send-button"]')) {
+          if (expression.includes("send-button") && expression.includes("const selectors")) {
             return { result: { value: { status: "focused" } } };
           }
           if (expression.includes("currentUrl: location.href")) {
@@ -605,7 +605,7 @@ describe("promptComposer", () => {
           if (expression.includes("composer-plus-btn")) {
             return { result: { value: { status: "closed" } } };
           }
-          if (expression.includes('button[data-testid="send-button"]')) {
+          if (expression.includes("send-button") && expression.includes("const selectors")) {
             return { result: { value: { status: "absent" } } };
           }
           if (expression.includes("dispatchClickSequence")) {
