@@ -2083,9 +2083,9 @@ export function buildUserTurnAttachmentExpressionForTest(options?: {
 
 export interface AttachmentVisibleOptions {
   /**
-   * Count a file input that still holds the file (default true). ChatGPT clears the input once
-   * its change handler takes the file, so after Oracle filled that input itself the FileList
-   * shows only that the handler has not run; such callers pass false.
+   * Count a file input that still holds the file (default true). ChatGPT's change handler empties
+   * the input whenever it runs, whether it keeps the file or not, so after Oracle filled that
+   * input itself the FileList shows only that the handler has not run; such callers pass false.
    */
   countFileInput?: boolean;
 }
