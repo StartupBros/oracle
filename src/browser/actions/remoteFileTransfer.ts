@@ -15,9 +15,10 @@ import { beginAttachmentEvidence } from "./attachmentEvidence.js";
 // dropped without a trace: no chip, no upload request. So wait for an input to exist, and repeat
 // a transfer ChatGPT never picked up. An accepted transfer shows its chip within about a second.
 //
-// Pickup is the chip, or ChatGPT's change handler clearing the input Oracle filled; the handler
-// clears it when it takes the file. A FileList still sitting in that input is Oracle's own
-// assignment, the sign of a dropped transfer, so it never counts as the file being visible.
+// Pickup is the chip. ChatGPT's change handler empties its input whether it keeps the file or
+// drops it, so an emptied input proves nothing. A FileList still sitting in the input Oracle
+// filled is Oracle's own assignment, so it never counts either, and it is emptied before the file
+// is sent again. A chip slower than the pickup wait would mean sending the file twice.
 const FILE_INPUT_WAIT_MS = 15_000;
 const PICKUP_WAIT_MS = 3_000;
 const MAX_TRANSFERS = 3;
@@ -119,12 +120,7 @@ async function waitForPickup(
 ): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    // A cleared input means the handler took the file even if its chip is still rendering, so
-    // transferring again would attach it twice.
-    if (
-      (await isAttachmentVisible(runtime, fileName, evidenceId, { countFileInput: false })) ||
-      (await transferredInput(runtime, evidenceId, fileName, "read")) === "consumed"
-    ) {
+    if (await isAttachmentVisible(runtime, fileName, evidenceId, { countFileInput: false })) {
       return true;
     }
     if (Date.now() >= deadline) {
@@ -135,34 +131,27 @@ async function waitForPickup(
 }
 
 /**
- * The input a transfer filled: "read" reports whether it still holds the file ("holding"), was
- * cleared ("consumed"), or is no longer recorded ("unknown", e.g. after a navigation). "clear"
- * empties a transfer the page never took, so the retry starts from the page's own state, and
- * "forget" drops the record; both return the same state as "read".
+ * Drops the record of the input a transfer filled. "clear" first empties that input if it still
+ * holds the file, so a transfer the page never took is not left beside the next one.
  */
 async function transferredInput(
   runtime: ChromeClient["Runtime"],
   key: string,
   fileName: string,
-  action: "read" | "clear" | "forget",
-): Promise<"holding" | "consumed" | "unknown"> {
-  const { result } = await runtime.evaluate({
+  action: "clear" | "forget",
+): Promise<void> {
+  await runtime.evaluate({
     expression: `(() => {
       const inputs = globalThis[${JSON.stringify(TRANSFERRED_INPUTS_KEY)}];
       const input = inputs?.get(${JSON.stringify(key)});
-      if (!(input instanceof HTMLInputElement)) return 'unknown';
-      const holding = Array.from(input.files || []).some((file) => file?.name === ${JSON.stringify(fileName)});
+      inputs?.delete(${JSON.stringify(key)});
       const action = ${JSON.stringify(action)};
-      if (action !== 'read') inputs.delete(${JSON.stringify(key)});
-      if (action === 'clear' && holding) {
-        // A transfer that could not use the files setter defines an own 'files' getter instead.
-        if (Object.prototype.hasOwnProperty.call(input, 'files')) delete input.files;
-        input.value = '';
-      }
-      return holding ? 'holding' : 'consumed';
+      if (action !== 'clear' || !(input instanceof HTMLInputElement)) return;
+      if (!Array.from(input.files || []).some((file) => file?.name === ${JSON.stringify(fileName)})) return;
+      // A transfer that could not use the files setter defines an own 'files' getter instead.
+      if (Object.prototype.hasOwnProperty.call(input, 'files')) delete input.files;
+      input.value = '';
     })()`,
     returnByValue: true,
   });
-  const state = result?.value;
-  return state === "holding" || state === "consumed" ? state : "unknown";
 }

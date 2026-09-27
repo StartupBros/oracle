@@ -297,11 +297,11 @@ try {
       }),
     );
   }
-  // Remote pickup: a transfer counts as taken only by its chip or by the page's change handler
-  // clearing the input. The FileList the transfer itself assigned never counts, and a file the
-  // handler took is not sent again while its chip is slow to render.
+  // Remote pickup: a transfer counts as taken only by its chip. Neither the FileList the transfer
+  // itself assigned nor an input the page's handler emptied without keeping the file counts, and
+  // a file whose chip shows within the pickup wait is not sent again.
   const pickupFile = { path: path.join(fixtures, names[2]), displayPath: names[2] };
-  for (const scenario of ["dropped-change", "slow-chip", "re-render"]) {
+  for (const scenario of ["dropped-change", "emptied-drop", "slow-chip", "re-render"]) {
     await evaluate(`(() => {
       document.body.innerHTML = '<main><form data-testid="composer"><textarea id="prompt-textarea" style="width:400px;height:100px"></textarea><input id="upload" type="file"><div id="chips"></div><button type="button" data-testid="send-button">Send</button></form></main>';
       window.pickup = { changes: 0, taken: [] };
@@ -312,15 +312,19 @@ try {
           const chip = document.createElement('div'); chip.dataset.testid = 'attachment-chip';
           const label = document.createElement('span'); label.textContent = file.name; chip.append(label);
           const remove = document.createElement('button'); remove.type = 'button'; remove.setAttribute('aria-label', 'Remove attachment'); chip.append(remove);
-          setTimeout(() => document.querySelector('#chips').append(chip), scenario === 'slow-chip' ? 4500 : 0);
+          setTimeout(() => document.querySelector('#chips').append(chip), scenario === 'slow-chip' ? 2000 : 0);
         }
         input.value = '';
       };
       const wire = input => input.addEventListener('change', () => {
         window.pickup.changes++;
-        // The composer is still mounting: the first change event reaches no handler, or the
-        // input is swapped for a fresh one that never saw the file.
+        // The composer is still mounting: the first change event reaches no handler, reaches one
+        // that empties the input but keeps nothing, or the input is swapped for a fresh one that
+        // never saw the file.
         if (window.pickup.changes === 1 && scenario === 'dropped-change') return;
+        if (window.pickup.changes === 1 && scenario === 'emptied-drop') {
+          input.value = ''; return;
+        }
         if (window.pickup.changes === 1 && scenario === 're-render') {
           const fresh = document.createElement('input'); fresh.type = 'file'; fresh.id = 'upload';
           wire(fresh); input.replaceWith(fresh); return;
@@ -355,7 +359,7 @@ try {
   assert.equal(offscreen.commits, 1);
   console.log(JSON.stringify({ mode: "offscreen-recovery", ...offscreen }));
   console.log(
-    "PROOF_OK local and remote three-file sends, filename-less images, delayed commitment, remote pickup (dropped change, slow chip, re-render), and offscreen recovery",
+    "PROOF_OK local and remote three-file sends, filename-less images, delayed commitment, remote pickup (dropped change, emptied drop, slow chip, re-render), and offscreen recovery",
   );
 } finally {
   await client?.close();
