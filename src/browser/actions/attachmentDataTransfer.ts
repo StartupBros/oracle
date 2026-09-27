@@ -8,11 +8,16 @@ import {
 
 const MAX_DATA_TRANSFER_BYTES = 20 * 1024 * 1024;
 
+// Page-side map from a caller's key to the exact input a transfer filled. The input is recorded
+// in the same evaluation that fills it, so a composer re-render cannot swap it for a fresh one.
+export const TRANSFERRED_INPUTS_KEY = "__oracleTransferredInputs";
+
 export async function transferAttachmentViaDataTransfer(
   runtime: ChromeClient["Runtime"],
   attachment: BrowserAttachment,
   selector: string,
   navigationUrl?: string,
+  recordAs?: string,
 ): Promise<{ fileName: string; size: number }> {
   const fileContent = await readFile(attachment.path);
   if (fileContent.length > MAX_DATA_TRANSFER_BYTES) {
@@ -102,6 +107,7 @@ export async function transferAttachmentViaDataTransfer(
     if (guard && !guard.validate(true)) return navigationFailure();
     fileInput.dispatchEvent(new Event('change', { bubbles: true }));
     if (guard && !guard.validate(true)) return navigationFailure();
+    ${recordAs ? `(globalThis[${JSON.stringify(TRANSFERRED_INPUTS_KEY)}] ??= new Map()).set(${JSON.stringify(recordAs)}, fileInput);` : ""}
     return { success: true, fileName: file.name, size: file.size };
     } finally { guard?.cleanup(); }
   })()`;

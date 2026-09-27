@@ -3,25 +3,44 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { uploadAttachmentViaDataTransfer } from "../../src/browser/actions/remoteFileTransfer.js";
+import { TRANSFERRED_INPUTS_KEY } from "../../src/browser/actions/attachmentDataTransfer.js";
 
 // Each case walks up to ~15 s of faked waits, one real I/O turn per step; a loaded full-suite
 // run can need more than the default 5 s of wall-clock time to do that.
 vi.setConfig({ testTimeout: 20_000 });
 
-// A fake remote page: the transfer expression carries the file bytes ("const base64Data"), the
-// visibility probe reports where it found the file ("source: 'file-input'"), and everything else
-// (attachment evidence bookkeeping) just succeeds.
-function fakePage({ inputAfterLookups = 0, pickedUpOnTransfer = 1 } = {}) {
+// A fake remote page. The transfer expression carries the file bytes ("const base64Data") and
+// fills the input. ChatGPT's change handler takes the file from transfer `pickedUpOnTransfer` on:
+// it clears that input and shows the chip `chipDelayMs` later. Before that, the input keeps
+// Oracle's own FileList, which the visibility probe reports unless told not to count file
+// inputs, as the real probe does. Everything else (attachment evidence bookkeeping) succeeds.
+function fakePage({ inputAfterLookups = 0, pickedUpOnTransfer = 1, chipDelayMs = 0 } = {}) {
   let lookups = 0;
   let transfers = 0;
+  let clears = 0;
+  let takenAt: number | undefined;
+  let holding = false;
   const runtime = {
     evaluate: vi.fn(async ({ expression }: { expression: string }) => {
       if (expression.includes("const base64Data")) {
         transfers += 1;
+        if (takenAt === undefined && transfers >= pickedUpOnTransfer) takenAt = Date.now();
+        holding = takenAt === undefined;
         return { result: { value: { success: true, fileName: "synthetic.txt", size: 20 } } };
       }
-      if (expression.includes("source: 'file-input'")) {
-        return { result: { value: { found: transfers >= pickedUpOnTransfer } } };
+      if (expression.includes(TRANSFERRED_INPUTS_KEY)) {
+        const action = /const action = "(\w+)"/.exec(expression)?.[1];
+        const state = transfers === 0 ? "unknown" : holding ? "holding" : "consumed";
+        if (action === "clear" && holding) {
+          clears += 1;
+          holding = false;
+        }
+        return { result: { value: state } };
+      }
+      if (expression.includes("source: 'attachments'")) {
+        const chip = takenAt !== undefined && Date.now() >= takenAt + chipDelayMs;
+        const countsInput = !expression.includes("const countFileInput = false");
+        return { result: { value: { found: chip || (countsInput && holding) } } };
       }
       return { result: { value: true } };
     }),
@@ -33,7 +52,7 @@ function fakePage({ inputAfterLookups = 0, pickedUpOnTransfer = 1 } = {}) {
     }),
     querySelector: vi.fn(async () => ({ nodeId: lookups > inputAfterLookups ? 2 : 0 })),
   };
-  return { runtime, dom, transfers: () => transfers };
+  return { runtime, dom, transfers: () => transfers, clears: () => clears };
 }
 
 let root: string;
@@ -117,4 +136,38 @@ test("gives up after three transfers with the existing error", async () => {
     error: { message: "Attachment did not appear in ChatGPT composer." },
   });
   expect(page.transfers()).toBe(3);
+});
+
+test("never takes its own FileList, left by a dropped change event, for a pickup", async () => {
+  const page = fakePage({ pickedUpOnTransfer: 2 });
+  const outcome = await upload(page);
+  expect(outcome).toEqual({ ok: true });
+  expect(page.transfers()).toBe(2);
+  // The dropped transfer's FileList is emptied before the file is sent again.
+  expect(page.clears()).toBe(1);
+  const probes = page.runtime.evaluate.mock.calls
+    .map(([{ expression }]) => expression)
+    .filter((expression) => expression.includes("source: 'attachments'"));
+  expect(probes.length).toBeGreaterThan(0);
+  expect(probes.every((expression) => expression.includes("const countFileInput = false"))).toBe(
+    true,
+  );
+});
+
+test("does not transfer again once ChatGPT took the file, while its chip is still slow", async () => {
+  const page = fakePage({ pickedUpOnTransfer: 1, chipDelayMs: 4_000 });
+  const outcome = await upload(page);
+  expect(outcome).toEqual({ ok: true });
+  expect(page.transfers()).toBe(1);
+  expect(page.clears()).toBe(0);
+});
+
+test("reports a taken file whose chip never appears without sending it again", async () => {
+  const page = fakePage({ pickedUpOnTransfer: 1, chipDelayMs: Number.POSITIVE_INFINITY });
+  const outcome = await upload(page);
+  expect(outcome).toMatchObject({
+    ok: false,
+    error: { message: "Attachment did not appear in ChatGPT composer." },
+  });
+  expect(page.transfers()).toBe(1);
 });

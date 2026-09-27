@@ -297,6 +297,50 @@ try {
       }),
     );
   }
+  // Remote pickup: a transfer counts as taken only by its chip or by the page's change handler
+  // clearing the input. The FileList the transfer itself assigned never counts, and a file the
+  // handler took is not sent again while its chip is slow to render.
+  const pickupFile = { path: path.join(fixtures, names[2]), displayPath: names[2] };
+  for (const scenario of ["dropped-change", "slow-chip", "re-render"]) {
+    await evaluate(`(() => {
+      document.body.innerHTML = '<main><form data-testid="composer"><textarea id="prompt-textarea" style="width:400px;height:100px"></textarea><input id="upload" type="file"><div id="chips"></div><button type="button" data-testid="send-button">Send</button></form></main>';
+      window.pickup = { changes: 0, taken: [] };
+      const scenario = ${JSON.stringify(scenario)};
+      const take = input => {
+        for (const file of Array.from(input.files || [])) {
+          window.pickup.taken.push(file.name);
+          const chip = document.createElement('div'); chip.dataset.testid = 'attachment-chip';
+          const label = document.createElement('span'); label.textContent = file.name; chip.append(label);
+          const remove = document.createElement('button'); remove.type = 'button'; remove.setAttribute('aria-label', 'Remove attachment'); chip.append(remove);
+          setTimeout(() => document.querySelector('#chips').append(chip), scenario === 'slow-chip' ? 4500 : 0);
+        }
+        input.value = '';
+      };
+      const wire = input => input.addEventListener('change', () => {
+        window.pickup.changes++;
+        // The composer is still mounting: the first change event reaches no handler, or the
+        // input is swapped for a fresh one that never saw the file.
+        if (window.pickup.changes === 1 && scenario === 'dropped-change') return;
+        if (window.pickup.changes === 1 && scenario === 're-render') {
+          const fresh = document.createElement('input'); fresh.type = 'file'; fresh.id = 'upload';
+          wire(fresh); input.replaceWith(fresh); return;
+        }
+        take(input);
+      });
+      wire(document.querySelector('#upload'));
+    })()`);
+    await uploadAttachmentViaDataTransfer({ runtime: Runtime, dom: DOM }, pickupFile, logger);
+    const state = await evaluate(`({
+      ...window.pickup,
+      chips: document.querySelectorAll('#chips [data-testid="attachment-chip"]').length,
+      heldInputs: Array.from(document.querySelectorAll('input[type=file]')).filter(input => input.files.length > 0).length,
+    })`);
+    assert.deepEqual(state.taken, [names[2]], scenario);
+    assert.equal(state.chips, 1, scenario);
+    assert.equal(state.heldInputs, 0, scenario);
+    assert.equal(state.changes, scenario === "slow-chip" ? 1 : 2, scenario);
+    console.log(JSON.stringify({ mode: `remote-pickup-${scenario}`, ...state }));
+  }
   await reset(true);
   const turns = await submitPrompt(
     { runtime: Runtime, input: Input, page: Page, baselineTurns: 0 },
@@ -311,7 +355,7 @@ try {
   assert.equal(offscreen.commits, 1);
   console.log(JSON.stringify({ mode: "offscreen-recovery", ...offscreen }));
   console.log(
-    "PROOF_OK local and remote three-file sends, filename-less images, delayed commitment, and offscreen recovery",
+    "PROOF_OK local and remote three-file sends, filename-less images, delayed commitment, remote pickup (dropped change, slow chip, re-render), and offscreen recovery",
   );
 } finally {
   await client?.close();

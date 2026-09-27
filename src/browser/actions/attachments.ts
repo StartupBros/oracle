@@ -2081,18 +2081,28 @@ export function buildUserTurnAttachmentExpressionForTest(options?: {
   });
 }
 
+export interface AttachmentVisibleOptions {
+  /**
+   * Count a file input that still holds the file (default true). ChatGPT clears the input once
+   * its change handler takes the file, so after Oracle filled that input itself the FileList
+   * shows only that the handler has not run; such callers pass false.
+   */
+  countFileInput?: boolean;
+}
+
 export async function waitForAttachmentVisible(
   Runtime: ChromeClient["Runtime"],
   expectedName: string,
   timeoutMs: number,
   logger?: BrowserLogger,
   evidenceId?: string,
+  options: AttachmentVisibleOptions = {},
 ): Promise<void> {
   // Attachments can take a few seconds to render in the composer (headless/remote Chrome is slower),
   // so respect the caller-provided timeout instead of capping at 2s.
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (await isAttachmentVisible(Runtime, expectedName, evidenceId)) {
+    if (await isAttachmentVisible(Runtime, expectedName, evidenceId, options)) {
       return;
     }
     await delay(200);
@@ -2107,17 +2117,19 @@ export async function isAttachmentVisible(
   Runtime: ChromeClient["Runtime"],
   expectedName: string,
   evidenceId?: string,
+  { countFileInput = true }: AttachmentVisibleOptions = {},
 ): Promise<boolean> {
   if (evidenceId) await confirmAttachmentEvidence(Runtime, evidenceId);
   const { result } = await Runtime.evaluate({
-    expression: buildAttachmentVisibleExpression(expectedName),
+    expression: buildAttachmentVisibleExpression(expectedName, countFileInput),
     returnByValue: true,
   });
   return Boolean((result?.value as { found?: boolean } | undefined)?.found);
 }
 
-function buildAttachmentVisibleExpression(expectedName: string): string {
+function buildAttachmentVisibleExpression(expectedName: string, countFileInput: boolean): string {
   return `(() => {
+    const countFileInput = ${JSON.stringify(countFileInput)};
     if ((${buildAttachmentEvidenceExpression([expectedName])})[0]) return { found: true, source: 'upload-evidence' };
     const namePattern = new RegExp(${JSON.stringify(buildAttachmentNamePattern(expectedName, true)?.source ?? "(?!)")}, 'iu');
     const matchesExpectedFileName = (value) => {
@@ -2135,7 +2147,7 @@ function buildAttachmentVisibleExpression(expectedName: string): string {
       return candidates.some(matchesExpectedFileName);
     };
 
-    const inputs = Array.from(document.querySelectorAll('input[type="file"]'));
+    const inputs = countFileInput ? Array.from(document.querySelectorAll('input[type="file"]')) : [];
     for (const input of inputs) {
       if (!(input instanceof HTMLInputElement)) continue;
       const files = Array.from(input.files || []);
