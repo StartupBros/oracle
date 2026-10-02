@@ -13,7 +13,7 @@
     "eslint/no-underscore-dangle": "off",
     "eslint/no-shadow": "off",
     "eslint/no-unmodified-loop-condition": "off",
-    "eslint/preserve-caught-error": "off",
+    "eslint/preserve-caught-error": "error",
     "oxc/no-accumulating-spread": "off",
     "oxc/no-map-spread": "off",
     "typescript/no-explicit-any": "off",

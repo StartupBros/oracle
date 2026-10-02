@@ -75,12 +75,17 @@ export function parseBridgeConnectionString(input: string): {
     throw new Error("Missing connection string.");
   }
 
-  let url: URL;
+  // No `cause` here: the URL TypeError carries the raw input, which includes the token.
+  let url: URL | undefined;
+  let urlError: unknown;
   try {
     url = raw.includes("://") ? new URL(raw) : new URL(`oracle+tcp://${raw}`);
   } catch (error) {
+    urlError = error;
+  }
+  if (!url) {
     throw new Error(
-      `Invalid connection string: ${error instanceof Error ? error.message : String(error)}`,
+      `Invalid connection string: ${urlError instanceof Error ? urlError.message : String(urlError)}`,
     );
   }
 
@@ -127,6 +132,7 @@ export async function readBridgeConnectionArtifact(
   } catch (error) {
     throw new Error(
       `Failed to parse connection artifact JSON at ${resolved}: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
     );
   }
   if (!parsed || typeof parsed !== "object") {

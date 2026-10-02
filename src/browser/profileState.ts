@@ -279,6 +279,7 @@ export async function acquireProfileRunLock(
       if (elapsed >= timeoutMs) {
         throw new Error(
           `Oracle profile lock still held by pid ${existing.pid} after ${Math.round(elapsed / 1000)}s`,
+          { cause: error },
         );
       }
       await delay(Math.min(pollMs, timeoutMs - elapsed));

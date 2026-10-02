@@ -17,6 +17,7 @@ export async function readUserConfigFile(
     }
     throw new Error(
       `Failed to read ${configPath}: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
     );
   }
 }
