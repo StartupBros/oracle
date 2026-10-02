@@ -5,6 +5,7 @@ export function normalizeProjectSourcesUrl(rawUrl: string): string {
   } catch (error) {
     throw new Error(
       `Invalid ChatGPT project URL: ${rawUrl} (${error instanceof Error ? error.message : String(error)})`,
+      { cause: error },
     );
   }
   const hostname = url.hostname.toLowerCase();

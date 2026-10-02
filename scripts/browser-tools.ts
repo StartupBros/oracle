@@ -528,7 +528,7 @@ async function listDevtoolsChromes(): Promise<ChromeProcessInfo[]> {
     output = execSync('ps -ax -o pid=,command=', { encoding: 'utf8' });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`Failed to enumerate processes: ${message}`);
+    throw new Error(`Failed to enumerate processes: ${message}`, { cause: error });
   }
   const processes: ChromeProcessInfo[] = [];
   output

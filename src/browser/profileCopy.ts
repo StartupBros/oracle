@@ -102,6 +102,7 @@ function resolveChromeProfileDirectory(
     } catch (error) {
       throw new Error(
         `--copy-profile: could not parse "Local State" to select the active Chrome profile: ${(error as Error).message}`,
+        { cause: error },
       );
     }
   }

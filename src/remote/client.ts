@@ -172,6 +172,7 @@ function parseHost(input: string): { hostname: string; port: number } {
   } catch (error) {
     throw new Error(
       `Invalid remote host: ${input} (${error instanceof Error ? error.message : String(error)})`,
+      { cause: error },
     );
   }
 }

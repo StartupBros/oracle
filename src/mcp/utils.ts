@@ -41,7 +41,9 @@ function resolveThroughSymlinks(target: string): string {
       }
       try {
         if (fs.lstatSync(current).isSymbolicLink()) {
-          throw new Error(`MCP output path contains an unresolved symlink: ${current}`);
+          throw new Error(`MCP output path contains an unresolved symlink: ${current}`, {
+            cause: error,
+          });
         }
       } catch (lstatError) {
         if ((lstatError as NodeJS.ErrnoException).code !== "ENOENT") {
