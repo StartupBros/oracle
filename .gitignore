@@ -14,5 +14,6 @@ vendor/oracle-notifier/OracleIcon.iconset
 oracle-*.tgz
 oracle-*.tgz.sha1
 oracle-*.tgz.sha256
-/.claude
+/.claude/*
+!/.claude/verify.sh
 /.release-artifacts/
