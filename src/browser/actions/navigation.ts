@@ -390,6 +390,10 @@ export async function ensureNotBlocked(
 }
 
 const LOGIN_CHECK_TIMEOUT_MS = 5_000;
+// Learned 2026-10-05: on a loaded remote Chrome the 5 s probe also fails while the user is signed
+// in (26 of 170 pro-gate sends refunded unsent, with clean reviews minutes apart). A logout
+// persists across a slower second look; a slow or blocked page does not.
+const LOGIN_RECHECK_TIMEOUT_MS = 15_000;
 const CHATGPT_ACCOUNT_EMAIL_ENV = "ORACLE_CHATGPT_ACCOUNT_EMAIL";
 
 function preferredChatGptAccountEmail(): string | null {
@@ -445,17 +449,42 @@ export async function ensureLoggedIn(
     );
   }
 
-  logger(
-    `Login probe failed (sessionStatus=${probe.status}, sessionAuthenticated=${Boolean(
-      probe.sessionAuthenticated,
-    )}, sessionResolved=${Boolean(probe.sessionResolved)}, backendStatus=${probe.backendStatus ?? "n/a"}, domLoginCta=${Boolean(
-      probe.domLoginCta,
-    )}, onAuthPage=${Boolean(probe.onAuthPage)}, appAuthenticated=${Boolean(
-      probe.appAuthenticated,
-    )}, cfBlocked=${Boolean(probe.cfBlocked)}, url=${probe.pageUrl ?? "n/a"}, error=${probe.error ?? "none"})`,
-  );
+  logger(`Login probe failed (${describeLoginProbe(probe)}); rechecking`);
 
-  const domLabel = probe.domLoginCta ? " Login button detected on page." : "";
+  // One slower look before failing: a signed-out page stays signed out, while a page that was
+  // still hydrating or a session fetch that timed out under load usually settles.
+  await delay(1500);
+  // The latest probe that ran decides; when the recheck cannot run at all, the first one stands.
+  let evidence = probe;
+  try {
+    const recheckOutcome = await Runtime.evaluate({
+      expression: buildLoginProbeExpression(LOGIN_RECHECK_TIMEOUT_MS),
+      awaitPromise: true,
+      returnByValue: true,
+    });
+    evidence = normalizeLoginProbe(recheckOutcome?.result?.value);
+    if (evidence.ok) {
+      logger(`Login confirmed on recheck (${describeLoginProbe(evidence)})`);
+      return;
+    }
+    logger(`Login recheck failed (${describeLoginProbe(evidence)})`);
+  } catch (error) {
+    logger(
+      `Login recheck could not run: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  // A Welcome back picker that would not choose an account is a sign-in problem with its own hint.
+  if (!welcomeBack.hint && !loginProbeShowsSignedOut(evidence)) {
+    // No look saw a sign-out signal, so do not tell the operator to sign in. The message keeps
+    // "session not detected" because manual-login callers retry on that text.
+    throw new Error(
+      `ChatGPT session not detected: login probe inconclusive (${describeLoginProbe(evidence)}). ` +
+        "The page confirmed neither a sign-in nor a sign-out; this is usually a slow or blocked page, not a logout.",
+    );
+  }
+
+  const domLabel = evidence.domLoginCta ? " Login button detected on page." : "";
   const cookieHint = options.remoteSession
     ? "The remote Chrome session is not signed into ChatGPT. Sign in there, then rerun."
     : (options.appliedCookies ?? 0) === 0
@@ -463,7 +492,26 @@ export async function ensureLoggedIn(
       : "ChatGPT login appears missing; open chatgpt.com in Chrome to refresh the session or provide inline cookies (--browser-inline-cookies[(-file)] / ORACLE_BROWSER_COOKIES_JSON).";
 
   const accountHint = welcomeBack.hint ? ` ${welcomeBack.hint}` : "";
-  throw new Error(`ChatGPT session not detected.${domLabel}${accountHint} ${cookieHint}`);
+  throw new Error(
+    `ChatGPT session not detected.${domLabel}${accountHint} ${cookieHint} (${describeLoginProbe(evidence)})`,
+  );
+}
+
+function describeLoginProbe(probe: LoginProbeResult): string {
+  return `sessionStatus=${probe.status}, sessionAuthenticated=${Boolean(
+    probe.sessionAuthenticated,
+  )}, sessionResolved=${Boolean(probe.sessionResolved)}, backendStatus=${probe.backendStatus ?? "n/a"}, domLoginCta=${Boolean(
+    probe.domLoginCta,
+  )}, onAuthPage=${Boolean(probe.onAuthPage)}, appAuthenticated=${Boolean(
+    probe.appAuthenticated,
+  )}, cfBlocked=${Boolean(probe.cfBlocked)}, url=${probe.pageUrl ?? "n/a"}, error=${probe.error ?? "none"}`;
+}
+
+/** A positive sign-out signal: a login CTA or auth page, a non-Cloudflare 401/403, or a session that resolved with no user. */
+function loginProbeShowsSignedOut(probe: LoginProbeResult): boolean {
+  if (probe.domLoginCta || probe.onAuthPage) return true;
+  if (!probe.cfBlocked && (probe.status === 401 || probe.status === 403)) return true;
+  return Boolean(probe.sessionResolved) && !probe.sessionAuthenticated;
 }
 
 interface WelcomeBackLoginAttempt {

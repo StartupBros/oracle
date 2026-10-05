@@ -1382,6 +1382,127 @@ describe("ensureLoggedIn", () => {
     );
   });
 
+  describe("recheck before failing", () => {
+    // Probe calls await their promise; the Welcome back picker does not, and an empty picker
+    // result ends that attempt at once.
+    function runtimeWithProbes(probes: Array<Record<string, unknown>>) {
+      const queue = [...probes];
+      const evaluate = vi.fn().mockImplementation(async (params: { awaitPromise?: boolean }) => {
+        if (!params?.awaitPromise) return { result: { value: {} } };
+        return { result: { value: queue.length > 1 ? queue.shift() : queue[0] } };
+      });
+      return { runtime: { evaluate } as unknown as ChromeClient["Runtime"], evaluate };
+    }
+    const inconclusive = {
+      ok: false,
+      status: 0,
+      backendStatus: 0,
+      domLoginCta: false,
+      onAuthPage: false,
+      error: "AbortError: signal is aborted without reason",
+    };
+
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    test("passes when the slower recheck finds the session", async () => {
+      const { runtime, evaluate } = runtimeWithProbes([
+        inconclusive,
+        { ok: true, status: 200, sessionAuthenticated: true, sessionResolved: true },
+      ]);
+      const pending = ensureLoggedIn(runtime, logger, { remoteSession: true });
+      await vi.advanceTimersByTimeAsync(2_000);
+      await expect(pending).resolves.toBeUndefined();
+      const probeCalls = evaluate.mock.calls.filter(([params]) => params?.awaitPromise);
+      expect(probeCalls).toHaveLength(2);
+      expect(String(probeCalls[1][0].expression)).toContain("15000");
+      expect(logger).toHaveBeenCalledWith(expect.stringContaining("Login confirmed on recheck"));
+    });
+
+    test("names an inconclusive probe instead of asking for a sign-in", async () => {
+      const { runtime } = runtimeWithProbes([inconclusive]);
+      const pending = expect(
+        ensureLoggedIn(runtime, logger, { remoteSession: true }),
+      ).rejects.toThrow(
+        expect.objectContaining({
+          message: expect.stringMatching(
+            /^ChatGPT session not detected: login probe inconclusive \(sessionStatus=0,.*backendStatus=0,.*cfBlocked=false,.*error=AbortError/,
+          ),
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(2_000);
+      await pending;
+      await expect(
+        (async () => {
+          const { runtime: again } = runtimeWithProbes([inconclusive]);
+          const run = ensureLoggedIn(again, logger, { remoteSession: true }).catch((e) => e);
+          await vi.advanceTimersByTimeAsync(2_000);
+          return String((await run).message);
+        })(),
+      ).resolves.not.toMatch(/Sign in there/);
+    });
+
+    test("treats a Cloudflare-blocked session check as inconclusive", async () => {
+      const { runtime } = runtimeWithProbes([{ ...inconclusive, status: 403, cfBlocked: true }]);
+      const pending = expect(
+        ensureLoggedIn(runtime, logger, { remoteSession: true }),
+      ).rejects.toThrow(/login probe inconclusive \(sessionStatus=403,.*cfBlocked=true/);
+      await vi.advanceTimersByTimeAsync(2_000);
+      await pending;
+    });
+
+    test("keeps the sign-in message, with probe detail, when the recheck sees a sign-out", async () => {
+      for (const signedOut of [
+        { ...inconclusive, domLoginCta: true },
+        { ...inconclusive, status: 401 },
+        { ...inconclusive, status: 200, sessionResolved: true, sessionAuthenticated: false },
+      ]) {
+        const { runtime } = runtimeWithProbes([inconclusive, signedOut]);
+        const pending = expect(
+          ensureLoggedIn(runtime, logger, { remoteSession: true }),
+        ).rejects.toThrow(
+          /^ChatGPT session not detected\.( Login button detected on page\.)? The remote Chrome session is not signed into ChatGPT\. Sign in there, then rerun\. \(sessionStatus=/,
+        );
+        await vi.advanceTimersByTimeAsync(2_000);
+        await pending;
+      }
+    });
+
+    test("lets the first probe decide when the recheck cannot run", async () => {
+      for (const [first, expected] of [
+        [
+          inconclusive,
+          /^ChatGPT session not detected: login probe inconclusive \(sessionStatus=0,/,
+        ],
+        [
+          { ...inconclusive, status: 401 },
+          /^ChatGPT session not detected\. The remote Chrome session is not signed into ChatGPT\./,
+        ],
+      ] as const) {
+        const evaluate = vi
+          .fn()
+          .mockImplementationOnce(async () => ({ result: { value: first } }))
+          .mockImplementationOnce(async () => ({ result: { value: {} } }))
+          .mockImplementationOnce(async () => {
+            throw new Error("Execution context was destroyed");
+          });
+        const runtime = { evaluate } as unknown as ChromeClient["Runtime"];
+        const pending = expect(
+          ensureLoggedIn(runtime, logger, { remoteSession: true }),
+        ).rejects.toThrow(expected);
+        await vi.advanceTimersByTimeAsync(2_000);
+        await pending;
+        expect(logger).toHaveBeenCalledWith(
+          "Login recheck could not run: Execution context was destroyed",
+        );
+      }
+    });
+  });
+
   test("treats welcome-back navigation during account click as login progress", async () => {
     const runtime = {
       evaluate: vi
